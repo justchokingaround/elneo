@@ -375,6 +375,19 @@ impl Inner {
     ) -> Result<Client> {
         let store_dir = self.data_dir.join("store");
 
+        // An explicit plain-HTTP homeserver URL is used verbatim.  The
+        // discovery probe below would first try https://<server_name>,
+        // which an HTTP-only homeserver cannot answer: the TLS handshake
+        // stalls instead of failing fast.
+        if let Some(url) = homeserver_url.filter(|url| is_plain_http_url(url)) {
+            return Client::builder()
+                .homeserver_url(url)
+                .sqlite_store(&store_dir, None)
+                .build()
+                .await
+                .context("Failed to build client");
+        }
+
         match Client::builder()
             .server_name(server_name)
             .sqlite_store(&store_dir, None)
@@ -500,6 +513,13 @@ impl ElneoDaemon {
             .context("Login request failed")?;
 
         info!("Login successful, device_id: {}", response.device_id);
+        // Remember the URL the user logged in with: restoring a session
+        // revisits this exact host, and an HTTP-only bridge has no usable
+        // https://<server_name> fallback.
+        media::write_atomic(
+            &self.inner.data_dir.join("homeserver"),
+            homeserver.trim().as_bytes(),
+        )?;
         self.finish_login(
             &client,
             &response.user_id,
@@ -750,7 +770,17 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
         };
 
         let server_name = session.meta.user_id.server_name().to_owned();
-        let client = self.inner.build_client(&server_name, None).await?;
+        // Reuse the URL the session was created with.  Sessions written
+        // before this file existed have none and keep the discovery +
+        // https fallback in `build_client'.
+        let homeserver = std::fs::read_to_string(self.inner.data_dir.join("homeserver"))
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty());
+        let client = self
+            .inner
+            .build_client(&server_name, homeserver.as_deref())
+            .await?;
         client.restore_session(session.clone()).await?;
 
         let info = SessionInfo {
@@ -1390,6 +1420,11 @@ fn parse_server_name(homeserver: &str) -> Result<matrix_sdk::ruma::OwnedServerNa
         .map_err(|e| anyhow::anyhow!("Invalid homeserver name: {e}"))
 }
 
+/// Whether `url` is an explicit plain-HTTP homeserver URL.
+fn is_plain_http_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|url| url.scheme() == "http")
+}
+
 /// Upper bound on one command frame.  The size comes straight off the
 /// wire; without a cap a bogus header makes the daemon allocate that
 /// many bytes up front.
@@ -1502,7 +1537,18 @@ pub fn spawn_writer(events: mpsc::UnboundedReceiver<OutEvent>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_profile_version, migrate_data_base_from, STORE_LAYOUT_VERSION};
+    use super::{
+        check_profile_version, is_plain_http_url, migrate_data_base_from, STORE_LAYOUT_VERSION,
+    };
+
+    #[test]
+    fn plain_http_homeserver_urls_are_recognized() {
+        assert!(is_plain_http_url("http://127.0.0.1:8008"));
+        assert!(is_plain_http_url("HTTP://bridge.local:8008"));
+        assert!(!is_plain_http_url("https://matrix.org"));
+        assert!(!is_plain_http_url("matrix.org"));
+        assert!(!is_plain_http_url(""));
+    }
 
     /// The rename's data-base migration, driven over explicit tempdir
     /// bases (the real `migrate_data_base` resolves both through
