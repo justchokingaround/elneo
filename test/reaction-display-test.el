@@ -447,5 +447,36 @@ converts and a `create-image' answers a fake image glyph."
     (mx-check "X prompt: the rebound C-j inserts a newline"
               (buffer-string) "ab\n"))
 
+;; ---- reactor names: roster, seen sender, localpart; +N; help-echo.
+  (with-temp-buffer
+    (setq-local elneo-room--members
+                '((:user-id "@a:hs" :name "Alice") (:user-id "@b:hs" :name nil)))
+    (setq-local elneo-room--seen (make-hash-table :test 'equal))
+    (puthash "$m:hs" '(:sender "@b:hs" :sender-name "Bob") elneo-room--seen)
+    (let ((cell (elneo-room--reaction-entry-cell
+                 '(:key "😆" :count 1 :senders ("@a:hs")))))
+      (mx-check "reactors: one roster name follows the key"
+                (substring-no-properties cell) "😆 Alice")
+      (mx-check "reactors: help-echo lists them"
+                (get-text-property 0 'help-echo cell) "Alice"))
+    (mx-check "reactors: seen sender-name, then localpart fallback"
+              (substring-no-properties
+               (elneo-room--reaction-entry-cell
+                '(:key "👍" :count 2 :senders ("@b:hs" "@carol:hs"))))
+              "👍 ×2 Bob, carol")
+    (let ((cell (elneo-room--reaction-entry-cell
+                 '(:key "👍" :count 5
+                   :senders ("@a:hs" "@b:hs" "@c:hs" "@d:hs" "@e:hs")))))
+      (mx-check "reactors: past three names a +N"
+                (substring-no-properties cell) "👍 ×5 Alice, Bob, c +2")
+      (mx-check "reactors: help-echo has all five"
+                (get-text-property 0 'help-echo cell) "Alice, Bob, c, d, e")))
+  (mx-check "reactors: wire senders vector becomes a list"
+            (plist-get (car (elneo-client--reaction-plists
+                             '(((key . "😆") (count . 1) (own . :json-false)
+                                (senders . ["@a:hs"])))))
+                       :senders)
+            '("@a:hs"))
+
   (message "reaction-display-test: %d passed, %d failed" pass fail)
   (kill-emacs (if (= fail 0) 0 1)))

@@ -99,6 +99,7 @@ fn reactions_merge_is_idempotent() {
     assert_eq!(entries[0].key, "👍");
     assert_eq!(entries[0].count, 2);
     assert!(entries[0].own);
+    assert_eq!(entries[0].senders, ["@a:hs", "@b:hs"]);
 
     let entries = reaction_entries(&state, "$t:hs", "@c:hs");
     assert!(!entries[0].own);

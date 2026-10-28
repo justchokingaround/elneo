@@ -748,6 +748,9 @@ pub struct ReactionEntry {
     pub count: u64,
     /// Whether this user is among the senders (drives the UI toggle).
     pub own: bool,
+    /// Sender user ids, sorted; omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub senders: Vec<String>,
 }
 
 /// One aggregated poll answer, with the votes the daemon has seen.
@@ -2649,6 +2652,7 @@ mod tests {
                         key: "👍".into(),
                         count: 2,
                         own: true,
+                        senders: vec![],
                     }]),
                     mentions: Some(Mentions {
                         user_ids: vec!["@bob:hs".into()],
@@ -2677,11 +2681,13 @@ mod tests {
                             key: "👍".into(),
                             count: 2,
                             own: true,
+                            senders: vec![],
                         },
                         ReactionEntry {
                             key: "❤".into(),
                             count: 1,
                             own: false,
+                            senders: vec!["@b:hs".into()],
                         },
                     ],
                 },
@@ -2690,7 +2696,7 @@ mod tests {
                     "event_id": "$e:hs",
                     "reactions": [
                         {"key": "👍", "count": 2, "own": true},
-                        {"key": "❤", "count": 1, "own": false}
+                        {"key": "❤", "count": 1, "own": false, "senders": ["@b:hs"]}
                     ]
                 }),
             ),
@@ -2880,6 +2886,7 @@ mod tests {
                             key: "👍".into(),
                             count: 3,
                             own: false,
+                            senders: vec![],
                         }]),
                         geo: None,
                         mentions: None,

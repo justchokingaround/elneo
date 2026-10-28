@@ -249,7 +249,8 @@ carries :thread-root: the root event id its `m.thread' relation
   "Hook run when an event's aggregated reactions change.
 Called with one argument: a plist with :profile :room-id :event-id
 (the target of the reactions) and :reactions — a list of plists with
-:key :count :own.  An empty :reactions list means no reactions remain."
+:key :count :own :senders.  An empty :reactions list means no reactions
+remain."
   :type 'hook
   :group 'elneo)
 
@@ -494,7 +495,8 @@ a reaction line is rendered."
   (mapcar (lambda (r)
             (list :key (alist-get 'key r)
                   :count (alist-get 'count r)
-                  :own (eq (alist-get 'own r) t)))
+                  :own (eq (alist-get 'own r) t)
+                  :senders (append (alist-get 'senders r) nil)))
           reactions))
 
 (defun elneo-client--poll-plist (poll)

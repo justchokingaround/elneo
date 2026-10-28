@@ -802,7 +802,8 @@ M-<).  Consumed by `elneo-room--on-history'.")
 
 (defvar-local elneo-room--reactions nil
   "Buffer-local: hash of event id -> aggregated reaction plists.
-(:key KEY :count N :own BOOL) — updated live and on page loads.")
+(:key KEY :count N :own BOOL :senders IDS) — updated live and on page
+loads.")
 
 (defvar-local elneo-room--reply-to nil
   "Buffer-local: event id the draft replies to, when in reply mode.")
@@ -1524,7 +1525,7 @@ the buffer's property layout (see
 Some clients react with a sticker: its MXC sits in the key, and
 the image is the whole reaction.  The text such clients show
 instead — the event's `shortcode' field — never reaches the
-aggregate elneo ships (:key :count :own only)."
+aggregate elneo ships (:key :count :own :senders only)."
   (and (stringp key) (string-prefix-p "mxc://" key)))
 
 ;; The bidi controls (marks, embeddings, overrides, isolates) plus
@@ -1606,6 +1607,37 @@ arrival pass redraws the room's pending cells."
            (with-current-buffer buffer
              (elneo-room--reactions-arrived))))))))
 
+;; Reactors render by name after the key, at most this many before a
+;; `+N'; the whole list is the cell's help-echo.
+(defconst elneo-room--reactor-names-shown 3
+  "Reactor names a reaction cell shows inline.")
+
+(defun elneo-room--reactor-name (id)
+  "Display name of reactor ID: roster name, else a seen sender name.
+The `seen' fallback names a reactor before the roster arrives (and
+in thread views, which fetch none); the localpart is the last
+resort."
+  (or (plist-get (seq-find (lambda (m) (equal (plist-get m :user-id) id))
+                           elneo-room--members)
+                 :name)
+      (and (hash-table-p elneo-room--seen)
+           (catch 'found
+             (maphash (lambda (_ msg)
+                        (when (and (equal (plist-get msg :sender) id)
+                                   (plist-get msg :sender-name))
+                          (throw 'found (plist-get msg :sender-name))))
+                      elneo-room--seen)
+             nil))
+      (if (string-match "\\`@\\([^:]+\\)" id) (match-string 1 id) id)))
+
+(defun elneo-room--reactor-names (senders)
+  "Names of reactor ids SENDERS, anonymized under `elneo-anon-mode'."
+  (mapcar (lambda (id)
+            (if elneo-anon-mode
+                (elneo-anon--person id nil)
+              (elneo-room--reaction-visible-key (elneo-room--reactor-name id))))
+          senders))
+
 (defun elneo-room--reaction-entry-cell (e)
   "The rendered cell of one aggregated reaction entry E.
 An MXC key shows the sticker (tag until it arrives); anything else
@@ -1621,18 +1653,33 @@ colliding with its own count.  Keys render inert — see
          (face (if (plist-get e :own)
                    'elneo-room-reaction-own
                  'elneo-room-reaction)))
-    (if (elneo-room--image-reaction-key-p raw)
-        (progn
-          (elneo-room--ensure-reaction-image raw)
-          (concat (elneo-room--reaction-image-cell raw)
-                  (when (> count 1)
-                    (propertize (format " ×%d" count) 'face face))))
-      (propertize (concat (if (string-match-p "[[:space:]\n\r]" raw)
-                              (format "\"%s\"" key)
-                            key)
+    (let* ((names (elneo-room--reactor-names (plist-get e :senders)))
+           (shown (seq-take names elneo-room--reactor-names-shown))
+           (more (- (length names) (length shown)))
+           (who (when names
+                  (propertize
+                   (concat " " (string-join shown ", ")
+                           (when (> more 0) (format " +%d" more)))
+                   'face 'elneo-room-reaction)))
+           (cell
+            (if (elneo-room--image-reaction-key-p raw)
+                (progn
+                  (elneo-room--ensure-reaction-image raw)
+                  (concat (elneo-room--reaction-image-cell raw)
                           (when (> count 1)
-                            (format " ×%d" count)))
-                  'face face))))
+                            (propertize (format " ×%d" count) 'face face))
+                          who))
+              (concat (propertize
+                       (concat (if (string-match-p "[[:space:]\n\r]" raw)
+                                   (format "\"%s\"" key)
+                                 key)
+                               (when (> count 1)
+                                 (format " ×%d" count)))
+                       'face face)
+                      who))))
+      (if names
+          (propertize cell 'help-echo (string-join names ", "))
+        cell))))
 
 (defun elneo-room--redraw-reaction-line (pos)
   "Redraw the reaction line starting at POS from the room's reactions table."
@@ -3615,7 +3662,20 @@ back to typed user ids, while the fetch runs."
                    (mapcar (lambda (m)
                              (list :user-id (alist-get 'user_id m)
                                    :name (alist-get 'display_name m)))
-                           (alist-get 'members event nil nil #'equal))))))))))
+                           (alist-get 'members event nil nil #'equal)))
+             ;; Reaction lines drawn before the roster name reactors
+             ;; by fallback; redraw them with roster names.
+             (elneo-room--redraw-reaction-lines))))))))
+
+(defun elneo-room--redraw-reaction-lines ()
+  "Redraw every reaction line in this buffer from the reactions table."
+  (save-excursion
+    (let ((pos (point-min)))
+      (while (setq pos (text-property-any pos (point-max)
+                                          'elneo-room-reaction-line t))
+        ;; The redraw leaves point after the line it rewrote.
+        (elneo-room--redraw-reaction-line pos)
+        (setq pos (point))))))
 
 ;;; Room permissions
 ;; The `roomPermissions' snapshot (protocol >= 15): this session's

@@ -1797,10 +1797,16 @@ fn reaction_entries(state: &ReactionState, target: &str, own_user_id: &str) -> V
     };
     let mut entries: Vec<ReactionEntry> = keys
         .iter()
-        .map(|(key, events)| ReactionEntry {
-            key: key.clone(),
-            count: events.len() as u64,
-            own: events.values().any(|s| s == own_user_id),
+        .map(|(key, events)| {
+            let mut senders: Vec<String> = events.values().cloned().collect();
+            senders.sort();
+            senders.dedup();
+            ReactionEntry {
+                key: key.clone(),
+                count: events.len() as u64,
+                own: events.values().any(|s| s == own_user_id),
+                senders,
+            }
         })
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
