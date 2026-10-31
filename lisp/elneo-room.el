@@ -439,9 +439,9 @@ parent that is not loaded yet."
         ;; allows for sending events that typically would not be seen, allowing
         ;; client testing
         (define-key map (kbd "X") #'elneo-room--X)
-        ;; `!' takes a reaction of yours back off (the one under point,
-        ;; the only one, or a pick).  telega's `!' is its react key.
-        (define-key map (kbd "!") #'elneo-room--remove-reaction)
+        ;; `!' is telega's react key; `a' stays as elneo's own.  As in
+        ;; telega, RET or a click on a reaction cell toggles it.
+        (define-key map (kbd "!") #'elneo-room--bang)
         (define-key map (kbd "d") #'elneo-room--d)
         (define-key map (kbd "e") #'elneo-room--e)
         ;; `m' stays reserved for telega's mark-message; room settings
@@ -1777,6 +1777,14 @@ resort."
               (elneo-room--reaction-visible-key (elneo-room--reactor-name id))))
           senders))
 
+(defvar elneo-room--reaction-cell-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'elneo-room-toggle-reaction-at-point)
+    (define-key map [mouse-2] #'elneo-room-toggle-reaction-at-point)
+    map)
+  "Keymap on reaction cells: a click toggles that reaction.
+RET reaches the same command through `elneo-room--ret'.")
+
 (defun elneo-room--reaction-entry-cell (e)
   "The rendered cell of one aggregated reaction entry E.
 An MXC key shows the sticker (tag until it arrives); anything else
@@ -1816,12 +1824,15 @@ colliding with its own count.  Keys render inert — see
                                  (format " ×%d" count)))
                        'face face)
                       who))))
-      ;; The raw key rides on the cell, so `!' over one of your own
-      ;; cells removes exactly that reaction without a prompt.
+      ;; The raw key rides on the cell: RET or a click there toggles
+      ;; that reaction, as on telega's reaction buttons (see
+      ;; `elneo-room-toggle-reaction-at-point').
       (propertize (if names
                       (propertize cell 'help-echo (string-join names ", "))
                     cell)
-                  'elneo-room-reaction-key raw))))
+                  'elneo-room-reaction-key raw
+                  'mouse-face 'highlight
+                  'keymap elneo-room--reaction-cell-map))))
 
 (defun elneo-room--redraw-reaction-line (pos)
   "Redraw the reaction line starting at POS from the room's reactions table."
@@ -3284,7 +3295,7 @@ An entry of `elneo-room--emoji-candidates' reacts with its emoji."
       (match-string 1 choice)
     choice))
 
-(elneo-room--defkey elneo-room--a ?a
+(defun elneo-room-react ()
   "React to the message at point.
 Offers the keys of `elneo-room-reaction-emoji-options' plus the
 reactions already on the message, then every emoji by name (\"thumbs\"
@@ -3292,6 +3303,7 @@ finds 👍), with free-form input accepted;
 picking any of the latter adds yours (\"me too\"), picking one you
 already used toggles it off.  Sticker keys list their mxcs, each
 with its thumbnail as the entry's annotation."
+  (interactive)
   (let* ((id (elneo-room--event-id-at-point))
          (entries (and id (hash-table-p elneo-room--reactions)
                        (gethash id elneo-room--reactions)))
@@ -3326,44 +3338,48 @@ with its thumbnail as the entry's annotation."
                             (elneo-server--error-string event))))
                (member key own-keys))))))))))
 
-(elneo-room--defkey elneo-room--remove-reaction ?!
-  "Remove one of your reactions from the message at point.
-On one of your own reaction cells, that reaction goes at once;
-elsewhere a message with a single own reaction loses it, and with
-several you pick which (sticker keys annotated with their image).
-`a' toggles too — re-picking an own key removes it — but `!' needs
-no remembering which key you used.  The reaction line redraws from
-the daemon's echo, like any remote change."
-  (let* ((id (elneo-room--event-id-at-point))
-         (entries (and id (hash-table-p elneo-room--reactions)
-                       (gethash id elneo-room--reactions)))
-         (own-keys (mapcar (lambda (e) (plist-get e :key))
-                           (cl-remove-if-not
-                            (lambda (e) (plist-get e :own)) entries)))
-         (at-point (get-text-property (point) 'elneo-room-reaction-key)))
+
+(elneo-room--defkey elneo-room--a ?a
+  "React to the message at point (`elneo-room-react')."
+  (elneo-room-react))
+
+(elneo-room--defkey elneo-room--bang ?!
+  "React to the message at point, on telega's react key.
+Same as `a' (`elneo-room-react'); like in telega, a reaction comes
+off with RET or a click on your own cell in the reaction line."
+  (elneo-room-react))
+
+(defun elneo-room-toggle-reaction-at-point (&optional event)
+  "Toggle the reaction cell at point (or at mouse EVENT).
+telega's reaction buttons: one of yours comes off, anyone else's
+is added as yours too (\"me too\").  This is how a reaction is
+removed, like in telega; `!' / `a' re-picking an own key works too."
+  (interactive (list last-nonmenu-event))
+  (when (mouse-event-p event)
+    (posn-set-point (event-start event)))
+  (let* ((key (get-text-property (point) 'elneo-room-reaction-key))
+         (id (elneo-room--event-id-at-point))
+         (entry (and key id (hash-table-p elneo-room--reactions)
+                     (seq-find (lambda (e) (equal (plist-get e :key) key))
+                               (gethash id elneo-room--reactions)))))
     (cond
-     ((null id) (user-error "No message at point"))
-     ((null own-keys) (user-error "You have not reacted to this message"))
+     ((null key) (user-error "No reaction at point"))
+     ((elneo-room--unsent-p (gethash id elneo-room--seen))
+      (user-error "Cannot react to a message that is not on the server yet"))
      (t
-      (let ((key (cond
-                  ((member at-point own-keys) at-point)
-                  ((null (cdr own-keys)) (car own-keys))
-                  (t (let ((completion-extra-properties
-                            '(:annotation-function
-                              elneo-room--reaction-annotation)))
-                       (completing-read "Remove reaction: " own-keys nil t))))))
-        (when (member key own-keys)
-          (elneo-send-reaction
-           elneo-room--profile elneo-room--room-id id key
-           (lambda (profile event)
-             (if (alist-get '@ok event nil nil #'equal)
-                 (message "Matrix: removed reaction %s"
-                          (if (elneo-room--image-reaction-key-p key)
-                              "[image react]"
-                            (elneo-room--reaction-visible-key key)))
-               (message "Matrix [%s] removing reaction failed: %s" profile
-                        (elneo-server--error-string event))))
-           'remove)))))))
+      (let ((remove (plist-get entry :own))
+            (shown (if (elneo-room--image-reaction-key-p key)
+                       "[image react]"
+                     (elneo-room--reaction-visible-key key))))
+        (elneo-send-reaction
+         elneo-room--profile elneo-room--room-id id key
+         (lambda (profile event)
+           (if (alist-get '@ok event nil nil #'equal)
+               (message "Matrix: %s reaction %s"
+                        (if remove "removed" "added") shown)
+             (message "Matrix [%s] reaction failed: %s" profile
+                      (elneo-server--error-string event))))
+         remove))))))
 
 (defun elneo-room--x-minibuffer-setup ()
   "The `X' prompt's minibuffer setup: rebind C-j there.
@@ -3678,6 +3694,8 @@ the draft, else prompt."
         (let ((reply-target (get-text-property (point) 'elneo-room-reply-target)))
           (cond
            (reply-target (elneo-room--jump-to-reply reply-target))
+           ((get-text-property (point) 'elneo-room-reaction-key)
+            (elneo-room-toggle-reaction-at-point))
            ;; Voice notes get their own player; plain media opens.
            ((elneo-room--voice-at-point) (elneo-room-play-voice-at-point))
            ((get-text-property (point) 'elneo-room-media)
