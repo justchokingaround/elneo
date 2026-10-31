@@ -536,6 +536,7 @@ window; the next `elneo-room-bar-show' on its frame fixes it."
     (add-hook 'elneo-room-update-hook #'elneo-room-bar--on-room-update)
     (add-hook 'elneo-session-trust-hook #'elneo-room-bar--on-session-state)
     (add-hook 'elneo-session-sync-hook #'elneo-room-bar--on-session-state)
+    (add-hook 'elneo-hidden-spaces-changed-hook #'elneo-room-bar--schedule-full)
     (elneo-room-bar-refresh-full)))
 
 (defun elneo-room-bar-ensure-on-frame (&optional frame)
@@ -571,8 +572,9 @@ state); old records without the field are ordinary rooms."
 (defun elneo-room-bar--filtered-rooms ()
   "All room records the bar's filters admit, in display order.
 The account, DM (`elneo-room-bar-dm-filter') and search filters
-apply; invites are kept (the invite-display policy filters them
-where it splits the list)."
+apply, and hidden spaces' rooms stay out (`elneo-room-hidden-p');
+invites are kept (the invite-display policy filters them where it
+splits the list)."
   (let ((rooms
          (cl-remove-if
           (lambda (room)
@@ -589,7 +591,7 @@ where it splits the list)."
                            (concat (plist-get room :display-name) " "
                                    (or (plist-get room :alias) "") " "
                                    (or (plist-get room :topic) "")))))))
-          (elneo-rooms-all))))
+          (elneo-rooms-shown))))
     (cond
      ((eq elneo-room-bar-sort 'alpha)
       (sort rooms
@@ -1646,7 +1648,7 @@ are down: dead, or alive but reporting a sync error.  Zero everywhere
 hides the segment."
   (let* ((rooms (cl-remove-if
                  (lambda (room) (plist-get room :removed))
-                 (elneo-rooms-all)))
+                 (elneo-rooms-shown)))
          (unread (apply #'+ (mapcar (lambda (r) (or (plist-get r :unread) 0))
                                     rooms)))
          (unread-rooms (cl-count-if (lambda (r) (> (or (plist-get r :unread) 0) 0))
@@ -1686,10 +1688,12 @@ Nothing shows when there is nothing wrong."
         (add-to-list 'global-mode-string 'elneo-mode-line-string 'append)
         (add-hook 'elneo-room-update-hook #'elneo-mode-line--update)
         (add-hook 'elneo-session-sync-hook #'elneo-mode-line--update)
+        (add-hook 'elneo-hidden-spaces-changed-hook #'elneo-mode-line--update)
         (elneo-mode-line--update))
     (setq elneo-mode-line-string nil)
     (remove-hook 'elneo-room-update-hook #'elneo-mode-line--update)
     (remove-hook 'elneo-session-sync-hook #'elneo-mode-line--update)
+    (remove-hook 'elneo-hidden-spaces-changed-hook #'elneo-mode-line--update)
     (setq global-mode-string
           (remove 'elneo-mode-line-string global-mode-string))
     (force-mode-line-update t)))

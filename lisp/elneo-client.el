@@ -2909,5 +2909,82 @@ new state.  Nothing re-enables it behind the user's back."
                       `((@type . "recoverRecoveryKey") (key . ,key))
                       callback))
 
+;;; Hidden spaces
+
+;; A hidden space takes everything under it (sub-spaces, their rooms,
+;; DMs a bridge files there) out of the room bar, the home page's tree
+;; and the mode-line count.  The rooms stay joined and syncing; the
+;; home page lists hidden spaces at its foot to bring them back.
+
+(defcustom elneo-hidden-spaces-file
+  (expand-file-name "hidden-spaces.el" (elneo--data-dir-base))
+  "File keeping the hidden spaces across sessions."
+  :type 'file
+  :group 'elneo)
+
+(defvar elneo-hidden-spaces 'unloaded
+  "Hidden spaces as (PROFILE . SPACE-ID) conses.
+`unloaded' until `elneo-hidden-spaces' first reads the file.")
+
+(defcustom elneo-hidden-spaces-changed-hook nil
+  "Hook run (no arguments) after a space was hidden or shown again."
+  :type 'hook
+  :group 'elneo)
+
+(defun elneo-hidden-spaces ()
+  "The hidden spaces, as (PROFILE . SPACE-ID) conses."
+  (when (eq elneo-hidden-spaces 'unloaded)
+    (setq elneo-hidden-spaces
+          (and (file-readable-p elneo-hidden-spaces-file)
+               (with-temp-buffer
+                 (insert-file-contents elneo-hidden-spaces-file)
+                 (ignore-errors (read (current-buffer)))))))
+  elneo-hidden-spaces)
+
+(defun elneo-space-subtree (profile space-id)
+  "Room ids under PROFILE's SPACE-ID, itself included, at any depth.
+Follows the joined spaces' `:space-children'; cycles are cut."
+  (let ((seen nil) (todo (list space-id)))
+    (while todo
+      (let ((id (pop todo)))
+        (unless (member id seen)
+          (push id seen)
+          (when-let* ((room (gethash (cons profile id) elneo--rooms)))
+            (setq todo (append (plist-get room :space-children) todo))))))
+    seen))
+
+(defun elneo-hidden-room-table ()
+  "Hash table of (PROFILE . ROOM-ID) keys the hidden spaces cover."
+  (let ((table (make-hash-table :test 'equal)))
+    (pcase-dolist (`(,profile . ,space) (elneo-hidden-spaces))
+      (dolist (id (elneo-space-subtree profile space))
+        (puthash (cons profile id) t table)))
+    table))
+
+(defun elneo-room-hidden-p (room &optional table)
+  "Non-nil when ROOM sits in a hidden space (or is one).
+TABLE is a reused `elneo-hidden-room-table'."
+  (gethash (cons (plist-get room :profile) (plist-get room :room-id))
+           (or table (elneo-hidden-room-table))))
+
+(defun elneo-rooms-shown ()
+  "`elneo-rooms-all' without the rooms of hidden spaces."
+  (let ((table (elneo-hidden-room-table)))
+    (cl-remove-if (lambda (r) (elneo-room-hidden-p r table))
+                  (elneo-rooms-all))))
+
+(defun elneo-space-set-hidden (profile space-id hide)
+  "Hide PROFILE's SPACE-ID with everything under it, or with HIDE nil,
+show it again.  Persists to `elneo-hidden-spaces-file'."
+  (let ((key (cons profile space-id)))
+    (setq elneo-hidden-spaces
+          (if hide
+              (cons key (delete key (elneo-hidden-spaces)))
+            (delete key (elneo-hidden-spaces))))
+    (make-directory (file-name-directory elneo-hidden-spaces-file) t)
+    (with-temp-file elneo-hidden-spaces-file
+      (prin1 elneo-hidden-spaces (current-buffer)))
+    (run-hooks 'elneo-hidden-spaces-changed-hook)))
+
 (provide 'elneo-client)
 ;;; elneo-client.el ends here
