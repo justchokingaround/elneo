@@ -610,5 +610,49 @@
                         (alist-get '@type req) "sendImage"))))
       (delete-directory dir t)))
 
+;; C-c C-v (telega's attach-clipboard): the clipboard's image bytes
+  ;; land in a temp file whose [image:] tag goes into the draft; a
+  ;; clipboard with no image (or bytes that do not sniff as one) is a
+  ;; user-error and leaves the draft alone.  The clipboard readers are
+  ;; stubbed: batch has no window system.
+  (mx-check "keymap: C-c C-v attaches the clipboard image (telega's key)"
+            (lookup-key elneo-room-mode-map (kbd "C-c C-v"))
+            #'elneo-room-attach-clipboard)
+  (let* ((png (unibyte-string #x89 ?P ?N ?G ?\r ?\n #x1a ?\n 0 0 0 0))
+         (buf (mx-attach-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (cl-letf (((symbol-function 'elneo-room--clipboard-image-gui)
+                     (lambda () png))
+                    ((symbol-function 'elneo-room--clipboard-image-external)
+                     #'ignore))
+            (elneo-room-attach-clipboard)
+            (let* ((draft (elneo-room--draft-text))
+                   (path (and (string-match "\\`\\[image: \\(.*\\)\\]\\'" draft)
+                              (match-string 1 draft))))
+              (mx-check "clipboard: draft holds an [image:] tag for a .png"
+                        (and path (string-suffix-p ".png" path)) t)
+              (mx-check "clipboard: temp file holds the exact bytes"
+                        (and path
+                             (with-temp-buffer
+                               (set-buffer-multibyte nil)
+                               (insert-file-contents-literally path)
+                               (buffer-string)))
+                        png)
+              (when path (delete-file path))))
+          (elneo-room--reset-input-area "")
+          (cl-letf (((symbol-function 'elneo-room--clipboard-image-gui)
+                     (lambda () "just text"))
+                    ((symbol-function 'elneo-room--clipboard-image-external)
+                     #'ignore))
+            (mx-check "clipboard: non-image is a user-error"
+                      (condition-case nil
+                          (progn (elneo-room-attach-clipboard) 'no-error)
+                        (user-error 'user-error))
+                      'user-error)
+            (mx-check "clipboard: non-image leaves the draft empty"
+                      (elneo-room--draft-text) "")))
+      (kill-buffer buf)))
+
   (message "results: %d passed, %d failed" pass fail)
   (kill-emacs (if (zerop fail) 0 1)))

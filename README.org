@@ -143,12 +143,13 @@ Direct rooms come from =M-x elneo-room-start-dm= — a private, encrypted DM wit
 
 ** Sending files
 
-Four workflows cover getting a file into a room:
+Five workflows cover getting a file into a room:
 
 1. *By path* — in a room buffer, =C-c C-a= picks a file with =read-file-name= and inserts a =[image: PATH]= or =[file: PATH]= tag (the type follows the extension) at the end of the draft. Tags mix freely with draft text and with each other, so one message can carry commentary plus several files.
 2. *Through a dired picker* — =C-c C-d= in a room buffer opens a dired buffer in a selected directory. Marked files there land in the draft area, similar to the =gnus-dired-attach= flow.  The binding lives only in that dired buffer; the picker closes itself once the files are attached.
 3. *From a dired you already have* — mark files in any dired (or put point on one file; directories are skipped) and run =M-x elneo-dired-send-files=. This one sends immediately, no draft involved. The room is picked with completing-read.  Turning on =elneo-dired-auto-target-visible-room= skips the prompt when a room buffer is unambiguous — exactly one is on screen — but as this can lead to accidental sending the prompt is the default. =M-x elneo-send-buffer-file= extends the same immediate-send flow to any file-backed buffer — it sends the file behind the current buffer. From an image-dired thumbnail buffer the image at point is resolved for sending.  A buffer with unsaved edits sends the version on disk with a notice.
 4. *Drag and drop* — dropping files from a file manager or any  other application onto a room buffer inserts their =[image: PATH]= / =[file: PATH]= tags into the draft area, exactly like =C-c C-a=: nothing is sent until =RET=.  Only local files attach — everything else you drag keeps the default Emacs behavior.
+5. *From the clipboard* — =C-c C-v= (telega's key) pastes the image in the clipboard — a screenshot from grim/flameshot/macOS, an image copied in a browser — into the draft: the bytes go to a temp file and its =[image: PATH]= tag is inserted, nothing is sent until =RET=.  The GUI clipboard is read directly (X, pgtk/Wayland, macOS); without one it falls back to =wl-paste=, =xclip= or =pngpaste=.
 
 Any of these flows also works on files behind Tramp: a remote path (=ssh:=, =/sudo:=, ...) is staged to a local temporary copy for the upload — the server doesn't know anything about tramp — and the copy is deleted once the send finishes, by success or failure.
 
@@ -193,6 +194,7 @@ Bare keys are commands on the history and self-insert in the draft — the same 
 | =C-c C-a= | =elneo-room-attach=            | Attach a file by path (= [image: PATH]= / =[file: PATH]=)  |
 | =C-c C-i= | =elneo-room-attach=            | Same command (alias; =C-c C-i= predates the telega policy) |
 | =C-c C-d= | =elneo-room-attach-dired=      | Open the dired attach picker for this room               |
+| =C-c C-v= | =elneo-room-attach-clipboard=  | Attach the clipboard's image (a screenshot) to the draft  |
 | =C-c C-k= | =elneo-room-cancel-reply=      | Cancel a pending reply or edit                           |
 | =M-RET=   | =elneo-room-preview-draft=     | Preview the draft rendered exactly as it would be sent   |
 | =TAB=     | =elneo-room--complete-mention= | Complete an @-mention (member picker in the minibuffer)  |
@@ -380,7 +382,7 @@ Note that the profile name is part of the link - so this is mostly useful for yo
 | Forward                       | =f=                             | =f=                                                                           | match                                                                   |
 | Mark / favorite message       | =m= / =*=                         | — (key reserved)                                                            | feature missing                                                         |
 | Pin message                   | —                             | =^=                                                                           | ours                                                                    |
-| Attach file                   | =C-c C-a= / =C-c C-f= / =C-c C-v=   | =C-c C-a= (=C-c C-i= alias), =C-c C-d= picker                                     | match; =C-c C-f= / =C-c C-v= reserved                                       |
+| Attach file                   | =C-c C-a= / =C-c C-f= / =C-c C-v=   | =C-c C-a= (=C-c C-i= alias), =C-c C-d= picker, =C-c C-v= clipboard image          | match; =C-c C-f= reserved                                                   |
 | Save media                    | =s=                             | =s= (=S= alias)                                                                 | match                                                                   |
 | Copy link                     | =l=                             | =l= (and =c= copies the text)                                                   | match                                                                   |
 | Describe message              | =i=                             | — (key reserved; retry media display lives on =I=)                            | feature missing                                                         |

@@ -374,6 +374,9 @@ parent that is not loaded yet."
         (define-key map (kbd "C-c C-a") #'elneo-room-attach)
         (define-key map (kbd "C-c C-i") #'elneo-room-attach)
         (define-key map (kbd "C-c C-d") #'elneo-room-attach-dired)
+        ;; telega's attach-clipboard key: paste a screenshot as an
+        ;; [image:] tag.
+        (define-key map (kbd "C-c C-v") #'elneo-room-attach-clipboard)
         (define-key map (kbd "C-c C-c") #'elneo-room-send)
         (define-key map (kbd "<prior>") #'elneo-room-older)
         (define-key map (kbd "o") #'elneo-room--o)
@@ -2988,7 +2991,7 @@ buffer text, so an untouched draft still counts as empty on send."
                   " (in thread)" ""))))
    (elneo-room--edit-to
     "── editing message: RET sends · C-j newline · C-c C-k cancels ──")
-   (t "── draft: RET sends · C-j newline · C-c C-a attach · C-c C-d dired ──")))
+   (t "── draft: RET sends · C-j newline · C-c C-a attach · C-c C-v paste · C-c C-d dired ──")))
 
 (defun elneo-room--update-separator ()
   "Rewrite the separator line to match the current reply state."
@@ -8495,6 +8498,95 @@ The no-image outcome: the link lands in the draft, RET sends it."
                     (buffer-local-value 'elneo-room--profile room-buffer)
                     url)
   (message "Matrix: no image at %s — the link is in the draft" url))
+
+;;;; Clipboard images
+
+(defconst elneo-room--clipboard-image-types
+  '(image/png image/jpeg image/webp image/gif image/bmp)
+  "Clipboard targets `elneo-room-attach-clipboard' asks for, best first.
+PNG leads: screenshot tools (grim, flameshot, macOS) offer it, and
+it round-trips losslessly.")
+
+(defun elneo-room--clipboard-image-gui ()
+  "Image bytes from the GUI clipboard, or nil.
+Asks the window system for each of
+`elneo-room--clipboard-image-types' the owner advertises in
+TARGETS — the same `gui-get-selection' path `yank-media' uses, so
+it works on X, pgtk/Wayland and NS alike.  Nil on a tty frame."
+  (when (display-graphic-p)
+    (let ((targets (ignore-errors
+                     (append (gui-get-selection 'CLIPBOARD 'TARGETS) nil))))
+      (catch 'found
+        (dolist (type elneo-room--clipboard-image-types)
+          (when (memq type targets)
+            (let ((data (ignore-errors
+                          (gui-get-selection 'CLIPBOARD type))))
+              (when (and (stringp data) (> (length data) 0))
+                (throw 'found (substring-no-properties data))))))
+        nil))))
+
+(defun elneo-room--clipboard-image-external ()
+  "Image bytes from the clipboard through an external tool, or nil.
+The fallback for frames that cannot reach the clipboard
+themselves — a tty frame of a daemon, an X build under Wayland:
+wl-paste on Wayland, xclip on X, pngpaste on macOS, whichever
+is installed.  Bytes come back raw (binary, unibyte)."
+  (let ((cmds (delq nil
+                    (list (and (getenv "WAYLAND_DISPLAY")
+                               '("wl-paste" "--no-newline" "--type" "image/png"))
+                          (and (getenv "DISPLAY")
+                               '("xclip" "-selection" "clipboard"
+                                 "-target" "image/png" "-out"))
+                          (and (eq system-type 'darwin)
+                               '("pngpaste" "-"))))))
+    (catch 'found
+      (dolist (cmd cmds)
+        (when (executable-find (car cmd))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (let ((coding-system-for-read 'binary))
+              (when (and (eql 0 (ignore-errors
+                                  (apply #'call-process (car cmd) nil
+                                         '(t nil) nil (cdr cmd))))
+                         (> (buffer-size) 0))
+                (throw 'found (buffer-string)))))))
+      nil)))
+
+(defun elneo-room--clipboard-image ()
+  "The clipboard's image as (DATA . TYPE), or nil when it holds none.
+TYPE is sniffed from the bytes with `image-type-from-data' rather
+than trusted from the target name: a tool answering a png request
+with something else (or text) must not become an [image:] tag."
+  (let ((data (or (elneo-room--clipboard-image-gui)
+                  (elneo-room--clipboard-image-external))))
+    (when data
+      (let* ((data (if (multibyte-string-p data)
+                       (encode-coding-string data 'binary)
+                     data))
+             (type (image-type-from-data data)))
+        (when type (cons data type))))))
+
+(defun elneo-room-attach-clipboard ()
+  "Attach the image in the clipboard (a screenshot) to the draft.
+Writes the bytes to a temp file and inserts its [image: PATH] tag
+at the end of the draft, the same tag \\[elneo-room-attach]
+writes; nothing goes out until RET, and a \\[universal-argument]
+RET still offers the scale prompt.  Telega's C-c C-v."
+  (interactive)
+  (unless elneo-room--backfilled
+    (user-error "Room not rendered yet — paste again once it is"))
+  (pcase (elneo-room--clipboard-image)
+    (`(,data . ,type)
+     (let* ((ext (if (eq type 'jpeg) "jpg" (symbol-name type)))
+            (path (make-temp-file
+                   (format-time-string "elneo-paste-%Y%m%d-%H%M%S-")
+                   nil (concat "." ext))))
+       (let ((coding-system-for-write 'binary))
+         (write-region data nil path nil 'quiet))
+       (elneo-room--insert-attach-tag path)
+       (message "Matrix: attached clipboard image %s"
+                (file-name-nondirectory path))))
+    (_ (user-error "No image in the clipboard"))))
 
 (defun elneo-room-attach-dired (&optional dir)
   "Open a dired buffer to pick files to attach to this room.
