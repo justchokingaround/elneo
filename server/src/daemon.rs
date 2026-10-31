@@ -422,6 +422,24 @@ impl Inner {
     }
 }
 
+/// A password login always creates a new device, but a `store` left by
+/// an earlier device (after a logout, or a lost session.json) pins its
+/// crypto store to that device id and fails every login.  With no
+/// session.json, rename the store aside (its keys stay on disk) so the
+/// login starts clean.  Returns where it went, None when nothing moved.
+fn set_aside_orphaned_store(data_dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    let store = data_dir.join("store");
+    if data_dir.join("session.json").exists() || !store.exists() {
+        return Ok(None);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let target = data_dir.join(format!("store.orphaned-{secs}"));
+    std::fs::rename(&store, &target).context("Failed to move the orphaned store aside")?;
+    Ok(Some(target))
+}
+
 pub struct ElneoDaemon {
     inner: SharedDaemon,
 }
@@ -501,6 +519,12 @@ impl ElneoDaemon {
         device_name: Option<String>,
     ) -> Result<SessionInfo> {
         let server_name = parse_server_name(homeserver)?;
+        if let Some(moved) = set_aside_orphaned_store(&self.inner.data_dir)? {
+            warn!(
+                "No session but a store was left (logout or lost session.json); moved it to {}",
+                moved.display()
+            );
+        }
         let client = self
             .inner
             .build_client(&server_name, Some(homeserver))
@@ -1549,8 +1573,24 @@ pub fn spawn_writer(events: mpsc::UnboundedReceiver<OutEvent>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_profile_version, is_plain_http_url, migrate_data_base_from, STORE_LAYOUT_VERSION,
+        check_profile_version, is_plain_http_url, migrate_data_base_from, set_aside_orphaned_store,
+        STORE_LAYOUT_VERSION,
     };
+
+    #[test]
+    fn orphaned_store_moves_aside_only_without_a_session() {
+        let dir = std::env::temp_dir().join(format!("elneo-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        std::fs::write(dir.join("session.json"), "{}").unwrap();
+        assert!(set_aside_orphaned_store(&dir).unwrap().is_none());
+        assert!(dir.join("store").exists());
+        std::fs::remove_file(dir.join("session.json")).unwrap();
+        let moved = set_aside_orphaned_store(&dir).unwrap().unwrap();
+        assert!(moved.exists() && !dir.join("store").exists());
+        assert!(set_aside_orphaned_store(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn plain_http_homeserver_urls_are_recognized() {
