@@ -346,6 +346,45 @@ differs from the one you read it in.  With this nil the pick in
   :group 'elneo-room
   :type 'boolean)
 
+(defcustom elneo-room-animate-images t
+  "Non-nil: short animated images (GIFs) play inline in room buffers.
+Only images within `elneo-room-animate-max-size',
+`elneo-room-animate-max-frames' and
+`elneo-room-animate-max-seconds' play; longer ones show their first
+frame, like every image did before.  An animation pauses while its
+room is in no visible window and stops for good when its message
+is re-rendered or the buffer killed."
+  :group 'elneo-room
+  :type 'boolean)
+
+(defcustom elneo-room-animate-mimetypes '("image/gif" "image/webp")
+  "Mimetypes whose images may animate inline.
+Images of these types are fetched whole rather than as a server
+thumbnail — homeservers thumbnail an animation to a still frame —
+so the size cap below also bounds that download."
+  :group 'elneo-room
+  :type '(repeat string))
+
+(defcustom elneo-room-animate-max-size (* 2 1024 1024)
+  "Largest file, in bytes, that animates inline.
+Bigger ones (and ones that do not state their size) get the usual
+still thumbnail.  Size is what the sender declared in the event."
+  :group 'elneo-room
+  :type 'integer)
+
+(defcustom elneo-room-animate-max-frames 150
+  "Most frames an inline animation may have; more shows a still frame.
+Every frame of a playing animation is decoded and cached by Emacs,
+so this bounds memory per image."
+  :group 'elneo-room
+  :type 'integer)
+
+(defcustom elneo-room-animate-max-seconds 15
+  "Longest loop, in seconds, that animates inline.
+Estimated as frame count times the first frame's delay."
+  :group 'elneo-room
+  :type 'number)
+
 (defcustom elneo-room-jump-page-limit 5
   "Older history pages fetched at most while jumping to a reply
 parent that is not loaded yet."
@@ -7692,6 +7731,10 @@ same placeholders.  Returns the last debounce timer armed, if any."
   (let* ((thumb (alist-get 'thumb_source media))
          (source (alist-get 'source media)))
     (cond
+     ;; A short animation: the whole file, since any thumbnail —
+     ;; sender's or homeserver's — is a still frame.
+     ((and source (elneo-room--animate-candidate-p media))
+      (cons source "file"))
      ;; Sender-provided plain thumbnail: cheap and small.
      ((and thumb (not (assq 'file thumb))) (cons thumb "thumb"))
      ;; Plain content: ask the homeserver for a downscaled thumbnail.
@@ -7850,6 +7893,73 @@ with the message, not orphaned under the fresh render."
                (elneo-room--linkify-string caption)))
       'elneo-room-event-id event-id))))
 
+;;;; Inline animation
+
+;; Animated images play through a small driver of our own rather than
+;; `image-animate': that one keeps decoding frames for buffers nobody
+;; looks at (a dozen open rooms with a GIF each is a dozen busy
+;; timers), and tracks the image by a fixed position, which every
+;; backfill page inserted above shifts — the animation then stops,
+;; or reads some other text's display property.  Here a marker
+;; follows the image, and a room in no visible window only polls.
+
+(defun elneo-room--animate-candidate-p (media)
+  "Non-nil when MEDIA (a message's media alist) may animate inline.
+Checks what the event declares — mimetype and size — before
+anything is fetched; the frame count and loop length are checked
+on the decoded image by `elneo-room--animate'."
+  (let ((size (alist-get 'size media)))
+    (and elneo-room-animate-images
+         (member (alist-get 'mimetype media) elneo-room-animate-mimetypes)
+         (numberp size)
+         (<= size elneo-room-animate-max-size))))
+
+(defun elneo-room--animate-short-p (multi)
+  "Non-nil when MULTI, an `image-multi-frame-p' answer, is short enough.
+MULTI is (FRAMES . DELAY); nil (a still image) is never short."
+  (and multi
+       (<= (car multi) elneo-room-animate-max-frames)
+       (<= (* (car multi) (or (cdr multi) image-default-frame-delay))
+           elneo-room-animate-max-seconds)))
+
+(defun elneo-room--animate (image pos)
+  "Start looping IMAGE, displayed at POS in the current buffer.
+A still image, or an animation over the frame/length caps, is left
+alone.  Returns non-nil when the animation started."
+  (when-let* (((display-images-p))
+              (multi (ignore-errors (image-multi-frame-p image)))
+              ((elneo-room--animate-short-p multi)))
+    ;; image-show-frame redraws only this buffer's windows.
+    (plist-put (cdr image) :animate-buffer (current-buffer))
+    (elneo-room--animate-tick image (copy-marker pos) (car multi) 0)
+    t))
+
+(defun elneo-room--animate-tick (image marker count n)
+  "Show frame N of IMAGE (COUNT frames) at MARKER, schedule the next.
+Stops — marker released, frames uncached — once the buffer is gone
+or MARKER no longer shows IMAGE (the message was re-rendered or
+deleted).  While the buffer is in no visible window it polls once
+a second without advancing."
+  (let ((buffer (marker-buffer marker)))
+    (cond
+     ;; `insert-image' displays a fresh (image . PLIST) cons sharing
+     ;; IMAGE's plist, so identity is the plist's, not the spec's.
+     ((not (and buffer
+                (eq (cdr-safe (get-text-property marker 'display buffer))
+                    (cdr image))))
+      (set-marker marker nil)
+      (ignore-errors (image-flush image)))
+     ((not (get-buffer-window buffer 'visible))
+      (run-with-timer 1 nil #'elneo-room--animate-tick
+                      image marker count n))
+     (t
+      (image-show-frame image n t)
+      (let ((delay (or (cdr (ignore-errors (image-multi-frame-p image)))
+                       image-default-frame-delay)))
+        (run-with-timer (max delay image-minimum-frame-delay) nil
+                        #'elneo-room--animate-tick
+                        image marker count (% (1+ n) count)))))))
+
 (defun elneo-room--put-image (beg end file event-id)
   "Replace BEG..END with the image stored at FILE.
 The inserted text keeps EVENT-ID so the region stays findable, and
@@ -7875,7 +7985,10 @@ re-inserted on its own line under the image — inline, it would be
 unreadable next to a thumbnail on a narrow display, and it would
 otherwise die with the placeholder in the `delete-region'.  The
 line carries the event id, so the block walk keeps it in the
-block."
+block.
+
+A short animated image (`elneo-room--animate-candidate-p') starts
+playing via `elneo-room--animate'."
   (let* ((media (get-text-property beg 'elneo-room-media-data))
          (name (get-text-property beg 'elneo-room-media-name))
          (caption (get-text-property beg 'elneo-room-media-caption))
@@ -7892,6 +8005,7 @@ block."
                     (create-image display nil nil :ascent 100
                                   :max-width 320 :max-height 240))
                 (error nil)))
+         (img-pos nil)
          (inhibit-read-only t))
     (save-excursion
       (delete-region beg end)
@@ -7901,6 +8015,7 @@ block."
             (when video
               (insert (propertize "▶ " 'face 'elneo-room-video-play
                                   'read-only t)))
+            (setq img-pos (point))
             (insert-image img (propertize (if video "[video]" "[image]")
                                           'elneo-room-event-id event-id
                                           'elneo-room-media (when media t)
@@ -7908,7 +8023,9 @@ block."
                                           'elneo-room-media-name name
                                           'read-only t))
             (insert " ")
-            (elneo-room--insert-media-caption caption event-id))
+            (elneo-room--insert-media-caption caption event-id)
+            (when (elneo-room--animate-candidate-p media)
+              (elneo-room--animate img img-pos)))
         (let ((kind (if video "video" "image")))
           (insert (propertize
                    (if name (format "[%s: %s]" kind name)
