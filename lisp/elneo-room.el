@@ -439,6 +439,9 @@ parent that is not loaded yet."
         ;; allows for sending events that typically would not be seen, allowing
         ;; client testing
         (define-key map (kbd "X") #'elneo-room--X)
+        ;; `!' takes a reaction of yours back off (the one under point,
+        ;; the only one, or a pick).  telega's `!' is its react key.
+        (define-key map (kbd "!") #'elneo-room--remove-reaction)
         (define-key map (kbd "d") #'elneo-room--d)
         (define-key map (kbd "e") #'elneo-room--e)
         ;; `m' stays reserved for telega's mark-message; room settings
@@ -1813,9 +1816,12 @@ colliding with its own count.  Keys render inert — see
                                  (format " ×%d" count)))
                        'face face)
                       who))))
-      (if names
-          (propertize cell 'help-echo (string-join names ", "))
-        cell))))
+      ;; The raw key rides on the cell, so `!' over one of your own
+      ;; cells removes exactly that reaction without a prompt.
+      (propertize (if names
+                      (propertize cell 'help-echo (string-join names ", "))
+                    cell)
+                  'elneo-room-reaction-key raw))))
 
 (defun elneo-room--redraw-reaction-line (pos)
   "Redraw the reaction line starting at POS from the room's reactions table."
@@ -3319,6 +3325,45 @@ with its thumbnail as the entry's annotation."
                    (message "Matrix [%s] reaction failed: %s" profile
                             (elneo-server--error-string event))))
                (member key own-keys))))))))))
+
+(elneo-room--defkey elneo-room--remove-reaction ?!
+  "Remove one of your reactions from the message at point.
+On one of your own reaction cells, that reaction goes at once;
+elsewhere a message with a single own reaction loses it, and with
+several you pick which (sticker keys annotated with their image).
+`a' toggles too — re-picking an own key removes it — but `!' needs
+no remembering which key you used.  The reaction line redraws from
+the daemon's echo, like any remote change."
+  (let* ((id (elneo-room--event-id-at-point))
+         (entries (and id (hash-table-p elneo-room--reactions)
+                       (gethash id elneo-room--reactions)))
+         (own-keys (mapcar (lambda (e) (plist-get e :key))
+                           (cl-remove-if-not
+                            (lambda (e) (plist-get e :own)) entries)))
+         (at-point (get-text-property (point) 'elneo-room-reaction-key)))
+    (cond
+     ((null id) (user-error "No message at point"))
+     ((null own-keys) (user-error "You have not reacted to this message"))
+     (t
+      (let ((key (cond
+                  ((member at-point own-keys) at-point)
+                  ((null (cdr own-keys)) (car own-keys))
+                  (t (let ((completion-extra-properties
+                            '(:annotation-function
+                              elneo-room--reaction-annotation)))
+                       (completing-read "Remove reaction: " own-keys nil t))))))
+        (when (member key own-keys)
+          (elneo-send-reaction
+           elneo-room--profile elneo-room--room-id id key
+           (lambda (profile event)
+             (if (alist-get '@ok event nil nil #'equal)
+                 (message "Matrix: removed reaction %s"
+                          (if (elneo-room--image-reaction-key-p key)
+                              "[image react]"
+                            (elneo-room--reaction-visible-key key)))
+               (message "Matrix [%s] removing reaction failed: %s" profile
+                        (elneo-server--error-string event))))
+           'remove)))))))
 
 (defun elneo-room--x-minibuffer-setup ()
   "The `X' prompt's minibuffer setup: rebind C-j there.

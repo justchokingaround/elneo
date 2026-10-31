@@ -207,6 +207,7 @@ Bare keys are commands on the history and self-insert in the draft — the same 
 |-----+------------------------------+---------------------------------------------------------|
 | =r=   | =elneo-room--r=                | Reply to the message at point                           |
 | =a=   | =elneo-room--a=                | React to it (again with your own key: toggle)           |
+| =!=   | =elneo-room--remove-reaction=  | Remove your reaction (the own cell at point, or a pick) |
 | =e=   | =elneo-room--e=                | Edit your own message at point                          |
 | =M-p= | =elneo-room--edit-previous=    | Edit the previous own text message (M-p again: earlier) |
 | =c=   | =elneo-room--c=                | Copy the message text at point                          |

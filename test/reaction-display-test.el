@@ -14,6 +14,9 @@
 ;; - `elneo-room--X': the arbitrary-key react prompt sends the key
 ;;   verbatim — no filtering — and re-sending one of our own keys
 ;;   toggles it off.
+;; - `elneo-room--remove-reaction' (`!'): removes the own cell at
+;;   point, the single own key, or a picked one; refuses a message
+;;   you never reacted to; other people's cells never get sent.
 ;; - `elneo-room--reaction-image-cell': the sticker when it is
 ;;   displayable, the `[image react]' tag otherwise, both carrying
 ;;   the `elneo-room-reaction-image' marker the arrival pass keys on.
@@ -477,6 +480,55 @@ converts and a `create-image' answers a fake image glyph."
                                 (senders . ["@a:hs"])))))
                        :senders)
             '("@a:hs"))
+
+;; ---- elneo-room--remove-reaction (`!').
+
+  (let ((sent nil)
+        (prompted nil)
+        (at-point nil))
+    (with-temp-buffer
+      (setq elneo-room--reactions (make-hash-table :test 'equal)
+            elneo-room--seen (make-hash-table :test 'equal))
+      (cl-letf (((symbol-function 'elneo-room--event-id-at-point)
+                 (lambda () "$ev"))
+                ((symbol-function 'elneo-room--in-input-p) (lambda () nil))
+                ((symbol-function 'get-text-property)
+                 (lambda (_pos prop &optional _obj)
+                   (and (eq prop 'elneo-room-reaction-key) at-point)))
+                ((symbol-function 'completing-read)
+                 (lambda (_p coll &rest _) (setq prompted coll) "🎉"))
+                ((symbol-function 'elneo-send-reaction)
+                 (lambda (&rest args) (push args sent))))
+        ;; No own reaction: refused, nothing sent.
+        (puthash "$ev" '((:key "👍" :count 1 :own nil)) elneo-room--reactions)
+        (mx-check "remove: none of ours errors"
+                  (condition-case nil
+                      (progn (elneo-room--remove-reaction) 'no-error)
+                    (user-error 'user-error))
+                  'user-error)
+        ;; One own key: removed without a prompt.
+        (puthash "$ev" '((:key "👍" :count 2 :own nil)
+                         (:key "❤" :count 1 :own t))
+                 elneo-room--reactions)
+        (elneo-room--remove-reaction)
+        (mx-check "remove: single own key, no prompt"
+                  (list (nth 3 (car sent)) (nth 5 (car sent)) prompted)
+                  '("❤" remove nil))
+        ;; Several own keys: the own cell at point wins …
+        (puthash "$ev" '((:key "👍" :count 2 :own t)
+                         (:key "🎉" :count 1 :own t)
+                         (:key "😢" :count 1 :own nil))
+                 elneo-room--reactions)
+        (setq sent nil at-point "👍")
+        (elneo-room--remove-reaction)
+        (mx-check "remove: own cell at point" (nth 3 (car sent)) "👍")
+        (mx-check "remove: cell at point skips the prompt" prompted nil)
+        ;; … someone else's cell at point falls through to the pick,
+        ;; offering only our keys.
+        (setq sent nil at-point "😢")
+        (elneo-room--remove-reaction)
+        (mx-check "remove: pick offers own keys only" prompted '("👍" "🎉"))
+        (mx-check "remove: picked key sent" (nth 3 (car sent)) "🎉"))))
 
   (message "reaction-display-test: %d passed, %d failed" pass fail)
   (kill-emacs (if (= fail 0) 0 1)))
