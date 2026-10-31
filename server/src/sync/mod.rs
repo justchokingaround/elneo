@@ -3054,7 +3054,7 @@ pub async fn room_summary(room: &Room, local: &RoomLocal) -> RoomSummary {
         room_state: room_state_string(room).to_owned(),
         name: room.name(),
         display_name,
-        avatar_url: room.avatar_url().map(|u| u.to_string()),
+        avatar_url: room_avatar_url(room, is_direct).await,
         topic: room.topic(),
         canonical_alias: room.canonical_alias().map(|a| a.to_string()),
         is_encrypted: room
@@ -3603,6 +3603,15 @@ pub(crate) async fn on_room_member(
         &ev.sender,
         ev.membership_change(),
     ) else {
+        // An avatar-only change renders no line, but a DM's bar avatar
+        // is the peer's (see `room_avatar_url`): re-announce so a new
+        // picture shows without waiting for unrelated traffic.
+        if room.avatar_url().is_none() && ev.state_key != *own {
+            let is_direct = room.is_direct().await.unwrap_or(false);
+            if dm_peer(&room, is_direct).await.as_deref() == Some(ev.state_key.as_ref()) {
+                emit_room_summary(&daemon, &room).await;
+            }
+        }
         return;
     };
     let ts = ts_u64(ev.origin_server_ts);
@@ -4147,6 +4156,54 @@ async fn member_display_name(room: &Room, sender: &UserId) -> Option<String> {
 async fn member_avatar_url(room: &Room, sender: &UserId) -> Option<String> {
     let member = room.get_member(sender).await.ok().flatten()?;
     member.avatar_url().map(|u| u.to_string())
+}
+
+/// The one other person of a one-to-one room, or None.
+///
+/// A DM rarely sets `m.room.avatar`; other clients show the peer's
+/// picture instead, and the bar showed a bare initial.  The peer is the
+/// single `m.direct` target that is not us, else — a room the other
+/// side flagged direct, or a bridge portal, never lands in our
+/// `m.direct` — the sole hero of a room with at most two active
+/// members.  Group DMs (several targets/heroes) stay None: no one
+/// person's face stands for them.
+async fn dm_peer(room: &Room, is_direct: bool) -> Option<OwnedUserId> {
+    let own = room.own_user_id();
+    if is_direct {
+        let mut targets: Vec<OwnedUserId> = room
+            .direct_targets()
+            .iter()
+            .filter_map(|t| t.as_user_id())
+            .filter(|u| *u != own)
+            .map(ToOwned::to_owned)
+            .collect();
+        if targets.len() == 1 {
+            return targets.pop();
+        }
+    }
+    if room.active_members_count() > 2 {
+        return None;
+    }
+    let mut heroes: Vec<OwnedUserId> = room
+        .heroes()
+        .await
+        .into_iter()
+        .map(|h| h.user_id)
+        .filter(|u| u != own)
+        .collect();
+    if heroes.len() == 1 { heroes.pop() } else { None }
+}
+
+/// The avatar mxc the bar shows for ROOM: its own `m.room.avatar`,
+/// else for a one-to-one room the peer's member avatar (see
+/// `dm_peer`).  The member event is local state, so this costs no
+/// request; a peer missing from the store just keeps the initial.
+async fn room_avatar_url(room: &Room, is_direct: bool) -> Option<String> {
+    if let Some(url) = room.avatar_url() {
+        return Some(url.to_string());
+    }
+    let peer = dm_peer(room, is_direct).await?;
+    member_avatar_url(room, &peer).await
 }
 
 // ---------------------------------------------------------------------------
