@@ -3187,10 +3187,37 @@ in a thread sends INTO that thread (like Element)."
     (elneo-room--update-separator)
     (message "Matrix: cancelled")))
 
+(defvar elneo-room--emoji-candidates nil
+  "Cache of `elneo-room--emoji-candidates'.")
+
+(defun elneo-room--emoji-candidates ()
+  "Every emoji Emacs knows as \"CHAR name\", so `a' searches by name."
+  (or elneo-room--emoji-candidates
+      (let (acc)
+        (map-char-table
+         (lambda (range script)
+           (when (eq script 'emoji)
+             (dolist (c (if (consp range)
+                            (number-sequence (car range) (cdr range))
+                          (list range)))
+               (when-let* ((name (get-char-code-property c 'name)))
+                 (push (format "%c %s" c (downcase name)) acc)))))
+         char-script-table)
+        (setq elneo-room--emoji-candidates (nreverse acc)))))
+
+(defun elneo-room--reaction-key (choice)
+  "The reaction key of CHOICE, a picked or typed `a' answer.
+An entry of `elneo-room--emoji-candidates' reacts with its emoji."
+  (if (and (string-match "\\`\\(\\S-+\\) " choice)
+           (member choice (elneo-room--emoji-candidates)))
+      (match-string 1 choice)
+    choice))
+
 (elneo-room--defkey elneo-room--a ?a
   "React to the message at point.
 Offers the keys of `elneo-room-reaction-emoji-options' plus the
-reactions already on the message, with free-form input accepted;
+reactions already on the message, then every emoji by name (\"thumbs\"
+finds 👍), with free-form input accepted;
 picking any of the latter adds yours (\"me too\"), picking one you
 already used toggles it off.  Sticker keys list their mxcs, each
 with its thumbnail as the entry's annotation."
@@ -3204,7 +3231,8 @@ with its thumbnail as the entry's annotation."
          (collection (delete-dups
                       (append own-keys
                               (mapcar (lambda (e) (plist-get e :key)) entries)
-                              elneo-room-reaction-emoji-options))))
+                              elneo-room-reaction-emoji-options
+                              (elneo-room--emoji-candidates)))))
     (if (null id)
         (user-error "No message at point")
       (let ((msg (gethash id elneo-room--seen)))
@@ -3216,7 +3244,8 @@ with its thumbnail as the entry's annotation."
           (let ((key (let ((completion-extra-properties
                             '(:annotation-function
                               elneo-room--reaction-annotation)))
-                       (completing-read "Reaction: " collection nil nil))))
+                       (elneo-room--reaction-key
+                        (completing-read "Reaction: " collection nil nil)))))
             (when (> (length key) 0)
               (elneo-send-reaction
                elneo-room--profile elneo-room--room-id id key
