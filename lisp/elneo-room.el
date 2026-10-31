@@ -354,7 +354,13 @@ parent that is not loaded yet."
 
 ;; Declared separately and assigned with setq: a plain `defvar' with an
 ;; initial value keeps the OLD keymap object when the file is reloaded,
-;; leaving existing buffers without the current bindings.
+;; leaving existing buffers without the current bindings.  The setq alone
+;; only reaches buffers opened afterwards, though: an open room buffer
+;; holds the old map object as its local map (and the thread map holds
+;; it as its parent), so after the setq `elneo-room--adopt-mode-map'
+;; repoints both — without it a reload left every open room on the old
+;; bindings (a new key reported as undefined until the buffer was
+;; reopened).
 (defvar elneo-room-mode-map nil
   "Keymap for Matrix room buffers; rebuilt on reload.")
 
@@ -433,6 +439,23 @@ parent that is not loaded yet."
         ;; reserved for telega's chatbuf input options.
         (define-key map (kbd "C-c C-b") #'elneo-room-bar-options)
         map))
+
+(defvar elneo-thread-mode-map)            ; elneo-thread.el, loaded after us
+
+(defun elneo-room--adopt-mode-map ()
+  "Point open room buffers and the thread map at `elneo-room-mode-map'.
+Run right after the keymap is rebuilt, so a reload of this file
+takes effect in buffers already open.  Thread buffers keep their
+own `elneo-thread-mode-map'; only its parent is swapped."
+  (when (and (boundp 'elneo-thread-mode-map)
+             (keymapp elneo-thread-mode-map))
+    (set-keymap-parent elneo-thread-mode-map elneo-room-mode-map))
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (eq major-mode 'elneo-room-mode)
+        (use-local-map elneo-room-mode-map)))))
+
+(elneo-room--adopt-mode-map)
 
 (defvar elneo-room--buffers (make-hash-table :test 'equal)
   "Hash mapping (PROFILE . ROOM-ID) to the room's buffer.")
