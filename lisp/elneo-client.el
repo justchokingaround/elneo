@@ -107,7 +107,7 @@ Record keys: :profile :room-id :room-state (\"joined\"/\"invited\")
 :name :display-name :topic :alias :encrypted :direct :space :unread
 :highlights :last-activity :preview :last-event-id :notification-mode
 :notification-mode-user-defined :bridge :upgraded-to :upgraded-from
-:buffer.  The upgrade links are the room's successor/predecessor
+:space-children :buffer.  The upgrade links are the room's successor/predecessor
 room ids (`m.room.tombstone' / the create predecessor), both absent
 for a room with no upgrade history.")
 
@@ -261,6 +261,13 @@ Called with one argument: a plist with :profile :room-id :event-id
 (the poll start event) and :poll — the refreshed
 `elneo-client--poll-plist', nil when the poll has no fold here
 (nothing to render)."
+  :type 'hook
+  :group 'elneo)
+
+(defcustom elneo-typing-update-hook nil
+  "Hook run when the members typing in a room change (protocol 26).
+Called with one argument: a plist with :profile :room-id :user-ids —
+the full list of other members typing now, nil when nobody is."
   :type 'hook
   :group 'elneo)
 
@@ -462,7 +469,9 @@ pre-rename %s looks intact — check and copy it over"
    :upgraded-from (alist-get 'upgraded_from room-summary)
    ;; Event-id strings; nil when the room carries no pinned-events
    ;; state (protocol 22).
-   :pinned (append (alist-get 'pinned_events room-summary) nil)))
+   :pinned (append (alist-get 'pinned_events room-summary) nil)
+   ;; A space's child room ids (protocol 26), nil elsewhere.
+   :space-children (append (alist-get 'space_children room-summary) nil)))
 
 (defun elneo-client--on-update-room (profile event)
   "Handle updateRoom for PROFILE: merge into the registry, notify UIs."
@@ -613,6 +622,13 @@ public m.read receipts."
                       (list :profile profile
                             :room-id (alist-get 'room_id event)
                             :receipts (elneo-client--receipt-plists event))))
+
+(defun elneo-client--on-update-typing (profile event)
+  "Handle updateTyping for PROFILE: notify UIs."
+  (run-hook-with-args 'elneo-typing-update-hook
+                      (list :profile profile
+                            :room-id (alist-get 'room_id event)
+                            :user-ids (append (alist-get 'user_ids event) nil))))
 
 (defun elneo-client--on-update-own-read-receipt (profile event)
   "Handle updateOwnReadReceipt for PROFILE: the account read up to
@@ -787,6 +803,7 @@ elneo-verify-device or M-x elneo-recover-keys when ready"
     (puthash "updateReactions" #'elneo-client--on-update-reactions callbacks)
     (puthash "updatePoll" #'elneo-client--on-update-poll callbacks)
     (puthash "updateReadReceipts" #'elneo-client--on-update-read-receipts callbacks)
+    (puthash "updateTyping" #'elneo-client--on-update-typing callbacks)
     (puthash "updateOwnReadReceipt"
              #'elneo-client--on-update-own-read-receipt callbacks)
     (puthash "updateEdited" #'elneo-client--on-update-edited callbacks)
@@ -1717,6 +1734,16 @@ the reaction-line display updates via `elneo-reactions-update-hook'."
                         (key . ,key)
                         ,@(when remove `((remove . t))))
                       callback))
+
+(defun elneo-send-typing (profile room-id typing)
+  "Start (TYPING non-nil) or stop PROFILE's typing notice in ROOM-ID.
+A no-op against daemons older than protocol 26."
+  (when (>= (or (elneo-server--daemon-protocol profile) 0) 26)
+    (elneo-server--call profile
+                        `((@type . "setTyping")
+                          (room_id . ,room-id)
+                          (typing . ,(if typing t :json-false)))
+                        nil)))
 
 (defun elneo-send-pin (profile room-id event-id unpin callback)
   "Pin EVENT-ID in PROFILE's ROOM-ID, or unpin it (UNPIN non-nil).

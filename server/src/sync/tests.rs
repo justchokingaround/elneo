@@ -2042,3 +2042,17 @@ fn image_filter_keeps_pictures_and_stickers() {
     // dispatches through --picture-p, which reads it).
     assert_eq!(page[2].msgtype, "m.sticker");
 }
+
+#[test]
+fn space_children_skip_removed_and_keyless() {
+    let events = vec![
+        serde_json::json!({"state_key": "!a:hs", "content": {"via": ["hs"]}}),
+        serde_json::json!({"state_key": "!gone:hs", "content": {}}),
+        serde_json::json!({"state_key": "!empty:hs", "content": {"via": []}}),
+        serde_json::json!({"content": {"via": ["hs"]}}),
+    ];
+    assert_eq!(
+        super::space_children_from_state(&events),
+        vec!["!a:hs".to_string()]
+    );
+}

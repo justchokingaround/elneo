@@ -883,6 +883,8 @@ them the same way (tags into the draft, nothing sent until RET)."
   (setq-local word-wrap t)
   (add-hook 'post-command-hook #'elneo-room--post-command nil t)
   (add-hook 'kill-buffer-hook #'elneo-room--draft-kill-save nil t)
+  (add-hook 'after-change-functions #'elneo-room--typing-after-change nil t)
+  (add-hook 'kill-buffer-hook #'elneo-room--typing-stop nil t)
   ;; Spell-checking other people's messages is noise: opt out of plain
   ;; global-flyspell, and of any global `after-change-major-mode-hook'
   ;; that force-enables it — honour the user's own blacklist if they
@@ -1427,6 +1429,75 @@ the body indent; callers floor it to taste."
 (defun elneo-room--quote-width ()
   "Columns available for quote text after the indent and marker."
   (max 20 (- (elneo-room--body-width) 3)))
+
+(defcustom elneo-room-send-typing-notifications t
+  "Non-nil: editing the draft tells the room you are typing.
+Needs protocol 26; others' typing shows above the draft separator either
+way."
+  :type 'boolean
+  :group 'elneo)
+
+(defvar-local elneo-room--typing nil
+  "Buffer-local: user ids of other members typing in this room now.")
+
+(defvar-local elneo-room--typing-sent nil
+  "Buffer-local: `float-time' of the last typing notice sent, or nil.")
+
+(defvar-local elneo-room--typing-overlay nil
+  "Buffer-local: overlay showing who types, above the separator.")
+
+(defun elneo-room--typing-text ()
+  "\"X is typing…\" for the typing line, nil when nobody is."
+  (pcase (elneo-room--reactor-names elneo-room--typing)
+    ('() nil)
+    (`(,a) (format "%s is typing…" a))
+    (`(,a ,b) (format "%s and %s are typing…" a b))
+    (names (format "%d people are typing…" (length names)))))
+
+(defun elneo-room--typing-redisplay ()
+  "Show the typing line above the separator, or remove it.
+An overlay's `before-string', so the history/draft markers never move."
+  (when (overlayp elneo-room--typing-overlay)
+    (delete-overlay elneo-room--typing-overlay))
+  (when-let* ((text (elneo-room--typing-text))
+              ((and elneo-room--backfilled
+                    (markerp elneo-room--input-beg)
+                    (marker-buffer elneo-room--input-beg)
+                    (> (elneo-room--input-beg-pos) (point-min)))))
+    (let ((pos (save-excursion
+                 (goto-char (elneo-room--input-beg-pos))
+                 (line-beginning-position 0))))
+      (setq elneo-room--typing-overlay (make-overlay pos pos))
+      (overlay-put elneo-room--typing-overlay 'before-string
+                   (propertize (concat text "\n") 'face 'shadow)))))
+
+(defun elneo-room--on-typing (upd)
+  "Typing-update hook: show who types on the draft separator."
+  (let ((buffer (elneo-room--buffer-for (plist-get upd :profile)
+                                        (plist-get upd :room-id))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq elneo-room--typing (plist-get upd :user-ids))
+        (elneo-room--typing-redisplay)))))
+
+(defun elneo-room--typing-after-change (beg _end _len)
+  "After-change: a user edit in the draft sends a typing notice.
+Repeats at most every 3 s; the homeserver's notice times out on its
+own once the edits stop."
+  (when (and elneo-room-send-typing-notifications
+             this-command
+             elneo-room--backfilled
+             (>= beg (elneo-room--input-beg-pos))
+             (not (and elneo-room--typing-sent
+                       (< (- (float-time) elneo-room--typing-sent) 3))))
+    (setq elneo-room--typing-sent (float-time))
+    (elneo-send-typing elneo-room--profile elneo-room--room-id t)))
+
+(defun elneo-room--typing-stop ()
+  "Withdraw this buffer's typing notice, if one went out."
+  (when elneo-room--typing-sent
+    (setq elneo-room--typing-sent nil)
+    (elneo-send-typing elneo-room--profile elneo-room--room-id nil)))
 
 (defvar-local elneo-room--members nil
   "Buffer-local: cached member roster of this room.
@@ -2912,7 +2983,8 @@ buffer text, so an untouched draft still counts as empty on send."
         (insert (propertize (elneo-room--separator-text)
                             'face 'elneo-room-input-separator
                             'read-only t)))
-      (elneo-room--mark-history-readonly))))
+      (elneo-room--mark-history-readonly)
+      (elneo-room--typing-redisplay))))
 
 (defun elneo-room--reset-input-area (draft)
   "Append the blank line, separator line and writable DRAFT tail.
@@ -2931,7 +3003,8 @@ buffer text, so an untouched draft still counts as empty on send."
     (when (> (length draft) 0)
       (insert draft))
     (elneo-room--mark-history-readonly)
-    (elneo-room--update-draft-placeholder)))
+    (elneo-room--update-draft-placeholder)
+    (elneo-room--typing-redisplay)))
 
 (defun elneo-room--in-input-p ()
   "Non-nil when point is in the writable draft area (or no history yet)."
@@ -4248,6 +4321,7 @@ optimistic echo; see `elneo-room--insert-provisional'); an edit
 renders nothing — the `updateEdited' echo re-renders the target,
 and a failed ack restores the text to the draft."
   (setq body (string-trim body))
+  (elneo-room--typing-stop)
   (when (> (length body) 0)
     ;; Callers without a mention plist (the dispatch from the draft)
     ;; get the same body-presence filter, so both send paths mention
@@ -8398,6 +8472,7 @@ more than once."
 (add-hook 'elneo-reactions-update-hook #'elneo-room--on-reactions-update)
 (add-hook 'elneo-poll-update-hook #'elneo-room--on-poll-update)
 (add-hook 'elneo-read-receipts-update-hook #'elneo-room--on-read-receipts)
+(add-hook 'elneo-typing-update-hook #'elneo-room--on-typing)
 (add-hook 'elneo-edited-update-hook #'elneo-room--on-edited)
 (add-hook 'elneo-redaction-update-hook #'elneo-room--on-redaction)
 (add-hook 'elneo-room-keys-updated-hook #'elneo-room--on-keys-updated)

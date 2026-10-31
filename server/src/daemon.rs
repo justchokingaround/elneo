@@ -261,6 +261,14 @@ impl Inner {
         );
         let d = Arc::clone(self);
         client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::space::child::SyncSpaceChildEvent,
+                  room: matrix_sdk::Room| {
+                let d = d.clone();
+                async move { crate::sync::on_space_child(d, ev, room).await }
+            },
+        );
+        let d = Arc::clone(self);
+        client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent,
                   room: matrix_sdk::Room| {
                 let d = d.clone();
@@ -976,6 +984,9 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
             } => {
                 sync::handle_send_reaction(self.inner.clone(), req, room_id, event_id, key, remove)
                     .await
+            }
+            Command::SetTyping { room_id, typing } => {
+                sync::handle_set_typing(self.inner.clone(), req, room_id, typing).await
             }
             Command::PinMessage {
                 room_id,

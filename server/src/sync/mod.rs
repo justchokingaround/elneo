@@ -3076,7 +3076,29 @@ pub async fn room_summary(room: &Room, local: &RoomLocal) -> RoomSummary {
         upgraded_to,
         upgraded_from,
         pinned_events: room_summary_pinned(room).await,
+        space_children: if room.is_space() {
+            Some(space_children_from_state(
+                &state_values(room, "m.space.child").await,
+            ))
+            .filter(|c| !c.is_empty())
+        } else {
+            None
+        },
     }
+}
+
+/// Child room ids out of a space's `m.space.child` state values: a
+/// child counts while its content carries a non-empty `via`.
+fn space_children_from_state(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|v| {
+            v.pointer("/content/via")
+                .and_then(|via| via.as_array())
+                .is_some_and(|via| !via.is_empty())
+        })
+        .filter_map(|v| v.get("state_key")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The room's pinned event ids (`m.room.pinned_events`), None when the
@@ -3651,6 +3673,18 @@ pub(crate) async fn on_room_avatar(
     emit_room_summary(&daemon, &room).await;
 }
 
+/// A `m.space.child` state change: re-announce the space's children.
+pub(crate) async fn on_space_child(
+    daemon: SharedDaemon,
+    _ev: matrix_sdk::ruma::events::space::child::SyncSpaceChildEvent,
+    room: Room,
+) {
+    if room.state() != RoomState::Joined {
+        return;
+    }
+    emit_room_summary(&daemon, &room).await;
+}
+
 /// A `m.room.pinned_events` state change: the summary's `pinned_events`
 /// is the single source of truth the client renders pinned marks from,
 /// so the echo re-announces it.
@@ -3876,6 +3910,21 @@ pub(crate) async fn on_receipt(daemon: SharedDaemon, ev: AnySyncEphemeralRoomEve
     }
     let receipts = match ev {
         AnySyncEphemeralRoomEvent::Receipt(ev) => ev.content,
+        AnySyncEphemeralRoomEvent::Typing(ev) => {
+            let own = room.own_user_id();
+            daemon.send(OutEvent::event(Event::UpdateTyping {
+                profile: daemon.profile.clone(),
+                room_id: room.room_id().to_string(),
+                user_ids: ev
+                    .content
+                    .user_ids
+                    .iter()
+                    .filter(|u| *u != own)
+                    .map(|u| u.to_string())
+                    .collect(),
+            }));
+            return;
+        }
         _ => return,
     };
 
@@ -5741,6 +5790,22 @@ async fn own_reactions_from_server(
     Err(anyhow::anyhow!(
         "relation listing did not finish in {MAX_PAGES} pages"
     ))
+}
+
+/// Start or stop the account's typing notice in ROOM_ID.
+pub async fn handle_set_typing(
+    daemon: SharedDaemon,
+    req: Option<u64>,
+    room_id: String,
+    typing: bool,
+) {
+    let Some((_, room)) = room_ctx(&daemon, req, &room_id).await else {
+        return;
+    };
+    match room.typing_notice(typing).await {
+        Ok(()) => daemon.ack(req, true, None),
+        Err(e) => daemon.ack(req, false, Some(format!("Typing notice failed: {e}"))),
+    }
 }
 
 /// Add an `m.reaction` to an event, or — with `remove` — toggle it off by

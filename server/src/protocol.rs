@@ -136,7 +136,14 @@ use serde::{Deserialize, Serialize};
 ///    m.push_rules echo of the next sync.  Old clients never send it and
 ///    old daemons just answer `@ok: false` on its wire word, so both
 ///    sides keep working.
-pub const PROTOCOL_VERSION: u32 = 25;
+/// 26: typing notifications.  The `setTyping` command starts or stops
+///    the account's typing notice in a joined room; `updateTyping`
+///    carries the full list of other members typing in a room each time
+///    an `m.typing` ephemeral event arrives (empty: nobody types).  Old
+///    clients ignore the event; old daemons answer `@ok: false`.
+///    Space summaries gain `space_children` (the `m.space.child` room
+///    ids), so clients can group and hide rooms by space.
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// serde `skip_serializing_if` helper: false-valued createRoom flags
 /// (public, is_direct) stay off the wire — deserialization defaults
@@ -537,6 +544,10 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remove: Option<bool>,
     },
+    /// Start (`typing: true`) or stop the account's typing notice in
+    /// ROOM_ID.  The SDK throttles repeats within its notice timeout.
+    #[serde(rename = "setTyping")]
+    SetTyping { room_id: String, typing: bool },
     /// Pin EVENT_ID in ROOM_ID (`m.room.pinned_events`), or — with
     /// `unpin` — take it off the list.  The state event only goes out
     /// when the list would actually change; the resulting list arrives
@@ -954,6 +965,10 @@ pub struct RoomSummary {
     /// absent when the room carries no pinned-events state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_events: Option<Vec<String>>,
+    /// A space's child room ids (`m.space.child` with a non-empty
+    /// `via`); absent on rooms that are not spaces or have no children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_children: Option<Vec<String>>,
 }
 
 /// One room as a space offers it (the `getRoomHierarchy` response's
@@ -1216,6 +1231,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_event_id: Option<String>,
         reactions: Vec<ReactionEntry>,
+    },
+    /// Other members typing in a room changed (`m.typing`): the full
+    /// list of their user ids, own account left out.  Display-only;
+    /// must not touch room-bar state.
+    #[serde(rename = "updateTyping")]
+    UpdateTyping {
+        profile: String,
+        room_id: String,
+        user_ids: Vec<String>,
     },
     /// Aggregated state of one poll changed (a vote arrived, was
     /// redacted or replaced, the start was edited, or a poll end
@@ -2221,6 +2245,18 @@ mod tests {
         );
 
         let cmd = serde_json::from_str::<Command>(
+            r#"{"@type":"setTyping","room_id":"!r:hs","typing":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetTyping {
+                room_id: "!r:hs".into(),
+                typing: true,
+            }
+        );
+
+        let cmd = serde_json::from_str::<Command>(
             r#"{"@type":"login","homeserver":"h","username":"u","password":"p"}"#,
         )
         .unwrap();
@@ -2307,6 +2343,7 @@ mod tests {
             upgraded_to: Some("!new:hs".into()),
             upgraded_from: Some("!old:hs".into()),
             pinned_events: Some(vec!["$e:hs".into()]),
+            space_children: None,
         };
         let cases: Vec<(Event, serde_json::Value)> = vec![
             (
@@ -2444,6 +2481,7 @@ mod tests {
                             upgraded_to: None,
                             upgraded_from: None,
                             pinned_events: None,
+                            space_children: None,
                             ..plain
                         }
                     },
@@ -2667,6 +2705,17 @@ mod tests {
                     "is_own": true, "reply_to": "$e:hs", "thread_root": "$troot:hs",
                     "reactions": [{"key": "👍", "count": 2, "own": true}],
                     "mentions": {"user_ids": ["@bob:hs"]}
+                }),
+            ),
+            (
+                Event::UpdateTyping {
+                    profile: "main".into(),
+                    room_id: "!r:hs".into(),
+                    user_ids: vec!["@b:hs".into()],
+                },
+                json!({
+                    "@type": "updateTyping", "profile": "main", "room_id": "!r:hs",
+                    "user_ids": ["@b:hs"]
                 }),
             ),
             (
@@ -3108,7 +3157,7 @@ mod tests {
                     release: RELEASE_VERSION.into(),
                 },
                 json!({
-                    "@type": "daemonInfo", "protocol": 25,
+                    "@type": "daemonInfo", "protocol": 26,
                     "release": env!("CARGO_PKG_VERSION")
                 }),
             ),
