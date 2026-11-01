@@ -3776,17 +3776,21 @@ The draft text plus the same rich converters `RET' would use
 rendered in a read-only preview buffer — the rich mark-up pass is
 identical to the room's own rich bodies, so yanked fontification,
 markup and code blocks preview exactly as sent.  Mention pills get
-their @-text only (the pills are a send-time decoration).  A draft
-that a bridge or the plain toggle would send unformatted is
-previewed as plain: exactly \"would send as plain text\"."
+their @-text only (the pills are a send-time decoration), but a
+draft carrying a mention previews rich even without markup — what
+`elneo-room-mention-pills' makes the send do.  A draft that a
+bridge or the plain toggle would send unformatted is previewed as
+plain: exactly \"would send as plain text\"."
   (interactive)
-  (let ((draft (buffer-substring (elneo-room--input-beg-pos) (point-max))))
+  (let* ((draft (buffer-substring (elneo-room--input-beg-pos) (point-max)))
+         (pills (and elneo-room-mention-pills
+                     (plist-get (elneo-room--send-mentions draft) :pairs))))
     (when (> (length (string-trim draft)) 0)
       (let ((formatted (and (elneo-room--rich-send-p)
                             (if elneo-room-yank-fontify
-                                (elneo-room--fontified-body draft)
+                                (elneo-room--fontified-body draft pills)
                               (elneo-room--formatted-body
-                               (substring-no-properties draft))))))
+                               (substring-no-properties draft) pills)))))
         (if (not formatted)
             (message "Matrix: would send as plain text")
           (with-help-window "*Matrix Draft Preview*"
@@ -3862,6 +3866,20 @@ image scales too, same as the dired flow)."
   "Non-nil: typing an `@' in the room draft opens member completion.
 TAB (`elneo-room--complete-mention') always offers the picker,
 whatever this says."
+  :type 'boolean
+  :group 'elneo-room)
+
+(defcustom elneo-room-mention-pills t
+  "Non-nil: a draft that mentions someone always carries a formatted body.
+`elneo-room--formatted-body' emits nothing for markup-free text —
+there is no HTML to send — but a mention needs one: a bridge that
+relays mentions (Discord's mautrix bridge, notably) only turns a
+mention into a native ping when the formatted body anchors it
+(`elneo-room--mention-pill-html' — its pill converter resolves the
+matrix.to link against the ids in `m.mentions').  The `m.mentions'
+block alone only alerts clients that read it (Matrix ones).  Set
+this to nil to keep mention drafts plain-only in bridged rooms that
+render a matrix.to anchor badly."
   :type 'boolean
   :group 'elneo-room)
 
@@ -4325,12 +4343,15 @@ transforms), then `code', **bold** and /italic/."
               "\\1<em>\\2</em>\\3" text))
   text)
 
-(defun elneo-room--formatted-body (text)
+(defun elneo-room--formatted-body (text &optional force)
   "Convert draft TEXT to an `org.matrix.custom.html' formatted body.
 The markup subset: ``` fenced blocks, `code' spans, **bold**,
 /italic/ and bare http(s) links.  nil when TEXT carries none of it
 — the plain body is the whole message then, byte for byte as
-before this existed."
+before this existed.  FORCE returns the escaped text anyway (which
+is exactly what the markup-free render already is): a mention
+draft needs a formatted body to hang its pill on, see
+`elneo-room-mention-pills'."
   (let* ((escaped (elneo-room--html-escape text))
          (parts (split-string escaped "```"))
          (code-p nil)
@@ -4345,7 +4366,7 @@ before this existed."
           (unless (string-equal inline part) (setq markedp t))
           (push inline out)))
       (setq code-p (not code-p)))
-    (and markedp (apply #'concat (nreverse out)))))
+    (and (or markedp force) (apply #'concat (nreverse out)))))
 
 (defun elneo-room--face-attr (face attr)
   "Resolve face attribute ATTR (a keyword) from a `face' value.
@@ -4440,16 +4461,17 @@ A stray :background-only face (hl-line, say) does not count."
         (cl-incf i))
       nil)))
 
-(defun elneo-room--fontified-body (text)
+(defun elneo-room--fontified-body (text &optional force)
   "Convert propertized draft TEXT to `org.matrix.custom.html'.
 With resolvable faces on it, each run renders as a styled <span>
 (see `elneo-room-yank-fontify'); unpropertized drafts take the
 plain markup path (`elneo-room--formatted-body') unchanged.
 ```-fenced blocks keep their existing shape — escaped as-is, faces
 ignored inside.  Non-nil whenever TEXT is fontified (the faces are
-the markup then); otherwise whatever the plain path returns."
+the markup then); otherwise whatever the plain path returns, FORCE
+included."
   (if (not (elneo-room--fontified-p text))
-      (elneo-room--formatted-body text)
+      (elneo-room--formatted-body text force)
     (let ((parts (split-string text "```"))
           (code-p nil)
           (out nil))
@@ -4468,6 +4490,9 @@ the markup then); otherwise whatever the plain path returns."
 MENTIONS optionally carries the mentions plist
 `elneo-room--send-mentions' builds (:ids IDS :room ROOM) — the IDS
 tag an `m.mentions' block, ROOM the @room everyone-flag.
+A mention also forces a formatted body onto a markup-free draft
+(`elneo-room-mention-pills'): the matrix.to pill it hangs there is
+what a relay bridge resolves into its own native mention.
 In reply mode the reply rides this (first) text segment and is
 consumed here; in edit mode the segment replaces the edited message
 instead of sending a new one.  Attachment tags in a reply draft send
@@ -4500,22 +4525,31 @@ and a failed ack restores the text to the draft."
                                  (plist-get (gethash reply-to
                                                      elneo-room--seen)
                                             :thread-root))))
+           ;; Whether this send needs a formatted body even without
+           ;; markup: a picked mention's pill is the only thing a relay
+           ;; bridge (Discord's) turns into a native ping — see
+           ;; `elneo-room-mention-pills'.  The @room flag needs none:
+           ;; the `m.mentions' room flag is its whole wire story, and
+           ;; plain "@room" is what Element sends too.
+           (pills (and elneo-room-mention-pills (plist-get m :pairs)))
            ;; The rich gate first: a plain-listed bridge sends the draft
            ;; exactly as typed (no formatted body at all), and
            ;; `elneo-room-yank-fontify' decides whether yanked faces
            ;; convert to HTML spans or only the plain markup applies.
            (formatted (and (elneo-room--rich-send-p)
                            (if elneo-room-yank-fontify
-                               (elneo-room--fontified-body body)
+                               (elneo-room--fontified-body body pills)
                              (elneo-room--formatted-body
-                              (substring-no-properties body))))))
+                              (substring-no-properties body) pills)))))
       ;; The wire body and the optimistic echo carry plain text only —
       ;; the faces live on in FORMATTED, never in the fallback.
       (setq body (substring-no-properties body))
       ;; The mention pills ride the formatted body: the matrix.to
-      ;; anchors are what other clients render as the mention; the
-      ;; `m.mentions' block only alerts.  The plain-fallback path
-      ;; stays plain — no formatted body, no pill.
+      ;; anchors are what other clients render as the mention, and
+      ;; what a bridge resolves into its own native mention (Discord's
+      ;; needs one — its plain-text path drops the id list); the
+      ;; `m.mentions' block only alerts.  The plain-fallback path stays
+      ;; plain — no formatted body, no pill.
       (when formatted
         (setq formatted (elneo-room--mention-pill-html
                          formatted (plist-get m :pairs) (plist-get m :room))))

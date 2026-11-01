@@ -106,6 +106,31 @@
         (when (get-buffer "*Matrix Draft Preview*")
           (kill-buffer "*Matrix Draft Preview*"))))
 
+    ;; --- a mention previews rich even without markup ---
+
+    ;; The send forces a formatted body onto a mention draft (the pill
+    ;; a relay bridge resolves); the preview mirrors it rather than
+    ;; claiming plain text, and shows the draft's @-text either way.
+    (let ((said nil))
+      (with-current-buffer (mx-preview-setup "hi @Al")
+        (setq elneo-room--draft-mentions '(("Al" . "@a:hs")))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) said))))
+          (goto-char (point-max))
+          (elneo-room-preview-draft))
+        (mx-check "preview: a mention draft is not called plain"
+                  (cl-member "Matrix: would send as plain text" said
+                             :test #'equal)
+                  nil)
+        (when (get-buffer "*Matrix Draft Preview*")
+          (with-current-buffer "*Matrix Draft Preview*"
+            (mx-check "preview: the mention draft gets its sent shape"
+                      (and (string-search "As sent:\nhi @Al" (buffer-string))
+                           t)
+                      t))
+          (kill-buffer "*Matrix Draft Preview*"))))
+
     ;; An empty draft previews nothing.
     (let ((plain-note nil))
       (with-current-buffer (mx-preview-setup "")

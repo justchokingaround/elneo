@@ -343,6 +343,25 @@ after ROOM-MENTION and is ignored."
             (elneo-room--mention-pill-html "plain" nil nil)
             "plain")
 
+  ;; --- the forced formatted body: a mention without markup still
+  ;; --- needs HTML, or a relay bridge has no pill to resolve ---
+
+  (mx-check "formatted: markup-free text stays nil without force"
+            (elneo-room--formatted-body "hi Alice")
+            nil)
+
+  (mx-check "formatted: FORCE returns the escaped text"
+            (elneo-room--formatted-body "hi Alice & <b>" t)
+            "hi Alice &amp; &lt;b&gt;")
+
+  (mx-check "formatted: FORCE never changes marked-up text"
+            (elneo-room--formatted-body "hi **Alice**" t)
+            "hi <strong>Alice</strong>")
+
+  (mx-check "fontified: FORCE rides the plain path"
+            (elneo-room--fontified-body "hi Alice" t)
+            "hi Alice")
+
   ;; --- the send: mentions ride `elneo-send-message' ---
 
   (let ((buf (mx-room-setup)))
@@ -361,8 +380,53 @@ after ROOM-MENTION and is ignored."
           (mx-check "send: the mention id rides along"
                     (nth 5 (car mx-sent)) '("@a:hs"))
           (mx-check "send: no room flag" (nth 6 (car mx-sent)) nil)
+          ;; The pill is the wire's native mention: mautrix-discord's
+          ;; pill converter only pings when the formatted body anchors
+          ;; the id in `m.mentions' — the plain path drops it.
+          (mx-check "send: a markup-free mention still sends HTML"
+                    (nth 2 (car mx-sent))
+                    "hi <a href=\"https://matrix.to/#/@a:hs\">Alice</a>")
           (mx-check "send: draft cleared"
                     (string-trim (elneo-room--draft-text)) ""))
+      (kill-buffer buf)))
+
+  ;; --- the forced formatted body is a mention thing only ---
+
+  (let ((buf (mx-room-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub))
+            (elneo-room--send-text "hi there"))
+          (mx-check "send: no mention, no formatted body"
+                    (nth 2 (car mx-sent)) nil))
+      (kill-buffer buf)))
+
+  (let ((buf (mx-room-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub)
+                    ((symbol-function 'elneo-room-get)
+                     (lambda (&rest _) '(:bridge "telegram"))))
+            (elneo-room--send-text "hi Alice" '(:ids ("@a:hs") :room nil
+                                                    :pairs (("Alice" . "@a:hs")))))
+          (mx-check "plain bridge: the id list still rides"
+                    (nth 5 (car mx-sent)) '("@a:hs"))
+          (mx-check "plain bridge: no formatted body, no pill"
+                    (nth 2 (car mx-sent)) nil))
+      (kill-buffer buf)))
+
+  (let ((buf (mx-room-setup))
+        (elneo-room-mention-pills nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub))
+            (elneo-room--send-text "hi Alice" '(:ids ("@a:hs") :room nil
+                                                    :pairs (("Alice" . "@a:hs")))))
+          (mx-check "mention-pills off: no forced formatted body"
+                    (nth 2 (car mx-sent)) nil))
       (kill-buffer buf)))
 
   ;; --- a failed send keeps the draft and the mention; retry mentions ---
@@ -390,7 +454,13 @@ after ROOM-MENTION and is ignored."
             (elneo-room--input-send))
           (mx-check "retry after failed send still mentions"
                     (cons (nth 0 (car mx-sent)) (nth 5 (car mx-sent)))
-                    '("hi Alice" "@a:hs")))
+                    '("hi Alice" "@a:hs"))
+          (mx-check "retry after failed send still sends the pill HTML"
+                    (and (nth 2 (car mx-sent))
+                         (string-match-p "matrix\\.to/#/@a:hs"
+                                         (nth 2 (car mx-sent)))
+                         t)
+                    t))
       (kill-buffer buf)))
 
   ;; --- triggers: TAB in history is inert; a typed @ fires ---
