@@ -343,6 +343,18 @@ after ROOM-MENTION and is ignored."
             (elneo-room--mention-pill-html "plain" nil nil)
             "plain")
 
+  (mx-check "pill: a typed id anchors on itself"
+            (elneo-room--mention-pill-html
+             "ping @discord_1:hs!" '(("@discord_1:hs" . "@discord_1:hs")) nil)
+            "ping <a href=\"https://matrix.to/#/@discord_1:hs\">@discord_1:hs</a>!")
+
+  (mx-check "pill: an id in a URL's href and text is never re-anchored"
+            (elneo-room--mention-pill-html
+             "<a href=\"https://matrix.to/#/@a:hs\">https://matrix.to/#/@a:hs</a> and @a:hs"
+             '(("@a:hs" . "@a:hs")) nil)
+            "<a href=\"https://matrix.to/#/@a:hs\">https://matrix.to/#/@a:hs</a> and \
+<a href=\"https://matrix.to/#/@a:hs\">@a:hs</a>")
+
   ;; --- the forced formatted body: a mention without markup still
   ;; --- needs HTML, or a relay bridge has no pill to resolve ---
 
@@ -361,6 +373,66 @@ after ROOM-MENTION and is ignored."
   (mx-check "fontified: FORCE rides the plain path"
             (elneo-room--fontified-body "hi Alice" t)
             "hi Alice")
+
+  ;; --- a full user id typed into the body counts as a mention ---
+  ;; --- (the bridge case: a Discord ghost has only its id)        ---
+
+  (mx-check "typed id: the id becomes a mention and its own pill text"
+            (let ((buf (mx-room-setup)))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (elneo-room--send-mentions "ping @discord_1:hs."))
+                (kill-buffer buf)))
+            '(:ids ("@discord_1:hs") :room nil
+                   :pairs (("@discord_1:hs" . "@discord_1:hs"))))
+
+  (mx-check "typed id: several ids stay in order, deduped"
+            (let ((buf (mx-room-setup)))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (plist-get (elneo-room--send-mentions
+                                "@b:hs and @a:hs and @b:hs")
+                               :ids))
+                (kill-buffer buf)))
+            '("@b:hs" "@a:hs"))
+
+  (mx-check "typed id: an id glued onto a word mentions nobody"
+            (let ((buf (mx-room-setup)))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (elneo-room--send-mentions "x@discord_1:hs"))
+                (kill-buffer buf)))
+            '(:ids nil :room nil :pairs nil))
+
+  (mx-check "typed id: an id inside a URL mentions nobody"
+            (let ((buf (mx-room-setup)))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (elneo-room--send-mentions
+                     "see https://matrix.to/#/@discord_1:hs"))
+                (kill-buffer buf)))
+            '(:ids nil :room nil :pairs nil))
+
+  (mx-check "typed id: a picked mention of the same id is not doubled"
+            (let ((buf (mx-room-setup)))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (setq elneo-room--draft-mentions
+                          '(("Noob Okay" . "@discord_1:hs")))
+                    (elneo-room--send-mentions
+                     "Noob Okay and @discord_1:hs"))
+                (kill-buffer buf)))
+            '(:ids ("@discord_1:hs") :room nil
+                   :pairs (("Noob Okay" . "@discord_1:hs"))))
+
+  (mx-check "typed id: off, the draft stays picker-only"
+            (let ((buf (mx-room-setup))
+                  (elneo-room-typed-mentions nil))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (elneo-room--send-mentions "ping @discord_1:hs"))
+                (kill-buffer buf)))
+            '(:ids nil :room nil :pairs nil))
 
   ;; --- the send: mentions ride `elneo-send-message' ---
 
@@ -391,6 +463,19 @@ after ROOM-MENTION and is ignored."
       (kill-buffer buf)))
 
   ;; --- the forced formatted body is a mention thing only ---
+
+  (let ((buf (mx-room-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub))
+            (elneo-room--send-text "ping @discord_1:hs"))
+          (mx-check "send: a typed id needs no picker to mention"
+                    (nth 5 (car mx-sent)) '("@discord_1:hs"))
+          (mx-check "send: ...and its pill rides the formatted body"
+                    (nth 2 (car mx-sent))
+                    "ping <a href=\"https://matrix.to/#/@discord_1:hs\">@discord_1:hs</a>"))
+      (kill-buffer buf)))
 
   (let ((buf (mx-room-setup)))
     (unwind-protect

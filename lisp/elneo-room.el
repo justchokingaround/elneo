@@ -3724,6 +3724,34 @@ Emacs restart."
   :type 'boolean
   :group 'elneo-room)
 
+(defcustom elneo-room-mention-pills t
+  "Non-nil: a draft that mentions someone always carries a formatted body.
+`elneo-room--formatted-body' emits nothing for markup-free text —
+there is no HTML to send — but a mention needs one: a bridge that
+relays mentions (Discord's mautrix bridge, notably) only turns a
+mention into a native ping when the formatted body anchors it
+(`elneo-room--mention-pill-html' — its pill converter resolves the
+matrix.to link against the ids in `m.mentions').  The `m.mentions'
+block alone only alerts clients that read it (Matrix ones).  Set
+this to nil to keep mention drafts plain-only in bridged rooms that
+render a matrix.to anchor badly."
+  :type 'boolean
+  :group 'elneo-room)
+
+(defcustom elneo-room-typed-mentions t
+  "Non-nil: a full user id typed into the draft counts as a mention.
+Writing `@somebody:server' in the body (pasted from a bridge's
+message, say — a Discord ghost's `@discord_<snowflake>:server' is
+the only handle one has for that user) tags the send with an
+`m.mentions' entry and a pill for that id, exactly like picking the
+member in the `@'-completion.  Without it the id stays plain text,
+which a bridge cannot turn into its native mention.  Ids inside a
+URL — a matrix.to permalink for someone — never count.  Set this
+to nil to mention only through the picker, if a pasted id should
+stay literal."
+  :type 'boolean
+  :group 'elneo-room)
+
 (defun elneo-room--input-send (&optional scale)
   "Send the draft and clear the input area.
 With a SCALE spec (from the RET prefix argument), it applies to
@@ -3866,20 +3894,6 @@ image scales too, same as the dired flow)."
   "Non-nil: typing an `@' in the room draft opens member completion.
 TAB (`elneo-room--complete-mention') always offers the picker,
 whatever this says."
-  :type 'boolean
-  :group 'elneo-room)
-
-(defcustom elneo-room-mention-pills t
-  "Non-nil: a draft that mentions someone always carries a formatted body.
-`elneo-room--formatted-body' emits nothing for markup-free text —
-there is no HTML to send — but a mention needs one: a bridge that
-relays mentions (Discord's mautrix bridge, notably) only turns a
-mention into a native ping when the formatted body anchors it
-(`elneo-room--mention-pill-html' — its pill converter resolves the
-matrix.to link against the ids in `m.mentions').  The `m.mentions'
-block alone only alerts clients that read it (Matrix ones).  Set
-this to nil to keep mention drafts plain-only in bridged rooms that
-render a matrix.to anchor badly."
   :type 'boolean
   :group 'elneo-room)
 
@@ -4154,25 +4168,73 @@ non-alphanumeric characters or the string edges."
                 (regexp-quote needle))
         body)))
 
+(defconst elneo-room--typed-id-regexp
+  "\\(?:\\`\\|[^[:alnum:]_.:=/+@-]\\)\\(@[[:alnum:]_.=/+-]+:[[:alnum:]-]+\\(?:\\.[[:alnum:]-]+\\)*\\)"
+  "A full user id written as body text, group 1 being the id.
+The leading boundary class keeps an id glued into a longer token
+(\"x@a:hs\") out — the way `elneo-room--mention-text-occurs-p'
+reads a mention — and the server half ends on an alphanumeric so
+the full stop of a sentence stays out of the id.")
+
+(defun elneo-room--url-spans (body)
+  "Conses of (START . END) for every bare URL in BODY."
+  (let ((pos 0)
+        (spans nil))
+    (while (string-match elneo-room--url-regexp body pos)
+      (push (cons (match-beginning 0) (match-end 0)) spans)
+      (setq pos (match-end 0)))
+    (nreverse spans)))
+
+(defun elneo-room--typed-mention-ids (body)
+  "Full user ids written into BODY as text, deduped, in order.
+What `elneo-room-typed-mentions' adds to a send: an id typed by
+hand mentions its user just like a picked one.  Ids sitting inside
+a URL are left out — a matrix.to permalink already names someone,
+and anchoring the id inside that link's own text would nest
+anchors."
+  (let ((pos 0)
+        (spans (elneo-room--url-spans body))
+        (ids nil))
+    (while (string-match elneo-room--typed-id-regexp body pos)
+      (let ((id (match-string 1 body))
+            (start (match-beginning 1)))
+        (unless (or (cl-member id ids :test #'equal)
+                    (cl-some (lambda (span)
+                               (and (>= start (car span))
+                                    (< start (cdr span))))
+                             spans))
+          (push id ids)))
+      (setq pos (match-end 1)))
+    (nreverse ids)))
+
 (defun elneo-room--send-mentions (body)
   "The mentions in segment BODY, as a plist (:ids IDS :room ROOM
 :pairs PAIRS).
 IDS comes from `elneo-room--draft-mentions'; an entry counts only
 while its display text occurs in the body
 (`elneo-room--mention-text-occurs-p') — the mention behind
-deleted text retracts itself.  PAIRS is the same surviving set,
-(DISPLAY . USER-ID) conses, kept aside for the pill render.  ROOM
-is non-nil when the body carries a standalone \"@room\" token
-(Element's textual convention; \"x@room\" keeps it out).  A plist
-of nils sends no block."
-  (let ((pairs (cl-remove-if-not
-                (lambda (pair)
-                  (elneo-room--mention-text-occurs-p (car pair) body))
-                elneo-room--draft-mentions))
-        (room (and
-               (string-match-p
-                "\\(?:\\`\\|[^[:alnum:]]\\)@room\\(?:[^[:alnum:]]\\|\\'\\)" body)
-               t)))
+deleted text retracts itself.  A full user id typed into the body
+counts too (`elneo-room--typed-mention-ids', see
+`elneo-room-typed-mentions'), unless a picked mention already
+names it.  PAIRS is that surviving set, (DISPLAY . USER-ID)
+conses, kept aside for the pill render — a typed id is its own
+display text.  ROOM is non-nil when the body carries a standalone
+\"@room\" token (Element's textual convention; \"x@room\" keeps it
+out).  A plist of nils sends no block."
+  (let* ((picked (cl-remove-if-not
+                  (lambda (pair)
+                    (elneo-room--mention-text-occurs-p (car pair) body))
+                  elneo-room--draft-mentions))
+         (typed (when elneo-room-typed-mentions
+                  (cl-set-difference (elneo-room--typed-mention-ids body)
+                                     (mapcar #'cdr picked)
+                                     :test #'equal)))
+         (pairs (append picked
+                        (mapcar (lambda (id) (cons id id)) typed)))
+         (room (and
+                (string-match-p
+                 "\\(?:\\`\\|[^[:alnum:]]\\)@room\\(?:[^[:alnum:]]\\|\\'\\)" body)
+                t)))
     (list :ids (mapcar #'cdr pairs) :room room :pairs pairs)))
 
 (defun elneo-room--mention-pill-html (html pairs room)
@@ -4190,7 +4252,10 @@ non-alphanumeric boundary on every side, longest first, in one
 scanning pass — the scan resumes at the display's end, so the
 consumed boundary character stays available to the next mention's
 opener and no anchor text is ever re-matched.  `<code>' regions —
-inline and fenced — keep their literal text: code never grows links."
+inline and fenced — keep their literal text: code never grows
+links, and neither does a tag's own attributes
+(`elneo-room--mention-pill-text') — a display text that also sits
+in a bare URL's href must not anchor inside the attribute."
   (if (not (or pairs room))
       html
     (let* ((entries (nconc (sort (copy-sequence pairs)
@@ -4212,7 +4277,7 @@ inline and fenced — keep their literal text: code never grows links."
           (let ((open (string-search "<code>" html pos)))
             (if open
                 (let ((close (string-search "</code>" html open)))
-                  (push (elneo-room--mention-pill-region
+                  (push (elneo-room--mention-pill-text
                          (substring html pos open) entries regex) out)
                   (if close
                       (progn
@@ -4220,10 +4285,36 @@ inline and fenced — keep their literal text: code never grows links."
                         (setq pos (+ close 7)))
                     (push (substring html open) out)
                     (setq pos (length html))))
-              (push (elneo-room--mention-pill-region
+              (push (elneo-room--mention-pill-text
                      (substring html pos) entries regex) out)
               (setq pos (length html)))))
         (apply #'concat (nreverse out))))))
+
+(defun elneo-room--mention-pill-text (html entries regex)
+  "Pillify the text of HTML against ENTRIES with REGEX, tags verbatim.
+A typed user id can sit inside a tag's attributes — a bare
+matrix.to URL becomes `<a href=\"https://matrix.to/#/@a:hs\">' in
+the formatted body — and an anchor grown inside an attribute is
+broken markup, so `<...>' interiors never pill."
+  (let ((pos 0)
+        (out nil))
+    (while (< pos (length html))
+      (let ((lt (string-search "<" html pos)))
+        (if (not lt)
+            (progn
+              (push (elneo-room--mention-pill-region
+                     (substring html pos) entries regex) out)
+              (setq pos (length html)))
+          (push (elneo-room--mention-pill-region
+                 (substring html pos lt) entries regex) out)
+          (let ((gt (string-search ">" html lt)))
+            (if gt
+                (progn
+                  (push (substring html lt (1+ gt)) out)
+                  (setq pos (1+ gt)))
+              (push (substring html lt) out)
+              (setq pos (length html)))))))
+    (apply #'concat (nreverse out))))
 
 (defun elneo-room--mention-pill-region (text entries regex)
   "Pillify one code-free HTML region TEXT against ENTRIES.
@@ -4231,8 +4322,11 @@ REGEX matches every entry's escaped display text with a captured
 group per alternative.  Scan-match, replace the display text with
 the matrix.to anchor, keep exactly one boundary character each
 side (none at the string edge); the scan moves to the display's
-end, not the match's."
+end, not the match's.  A display text inside a bare URL rides on:
+the URL is already a link, and anchoring inside its text would
+nest anchors."
   (let ((pos 0)
+        (spans (elneo-room--url-spans text))
         (out nil))
     (while (< pos (length text))
       (if (string-match regex text pos)
@@ -4241,11 +4335,15 @@ end, not the match's."
             (if-let* ((found (cl-loop for i from 1
                                       for entry in entries
                                       if (match-beginning i)
-                                      return (cons entry i))))
-                (let* ((entry (car found))
-                       (i (cdr found))
-                       (gstart (match-beginning i))
-                       (gend (match-end i)))
+                                      return (cons entry i)))
+                      (gstart (match-beginning (cdr found)))
+                      (gend (match-end (cdr found)))
+                      (not-in-url
+                       (not (cl-some (lambda (span)
+                                       (and (>= gstart (car span))
+                                            (< gstart (cdr span))))
+                                     spans))))
+                (let ((entry (car found)))
                   (push (substring text pos mb) out)
                   (push (concat
                          ;; The boundary character rides the match;
@@ -4260,7 +4358,8 @@ end, not the match's."
                                  (substring text gstart gend)))
                         out)
                   (setq pos gend))
-              ;; No group answered (not by construction) — ride on.
+              ;; No group answered (not by construction), or the text is
+              ;; part of a URL — ride on.
               (push (substring text pos me) out)
               (setq pos me)))
         (push (substring text pos) out)
