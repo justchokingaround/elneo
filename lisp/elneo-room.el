@@ -4870,19 +4870,32 @@ commands refuse these."
 
 (defun elneo-room--own-sender ()
   "Cons (USER-ID . NAME) of this buffer's account, for local echoes.
-The name mirrors what the daemon echoes for own messages: the most
-recent rendered own message's sender name when there is one, else
-the user id's local part — so the provisional block and the real
-echo it turns into agree on the name."
+The name mirrors what the daemon echoes for own messages: the
+room's own roster entry first — the `m.room.member' display name,
+which a bridge may set and which the daemon itself resolves the
+echo's sender name from — then the most recent rendered own
+message's sender name (the roster fetch is fire-and-forget, so it
+may not be back yet), else the user id's local part.  Taking a
+rendered name first went wrong in a bridged IRC room: the first
+message of a session fell back to the localpart (\"ivan\"), and
+later sends then copied that name, since the ack re-keys the
+provisional block and the server's echo never replaces it."
   (let* ((uid (plist-get (alist-get elneo-room--profile elneo-accounts
                                     nil nil #'equal)
                          :user-id))
-         (name (catch 'name
-                 (dolist (id (reverse (elneo-room--ordered-event-ids)))
-                   (let ((msg (gethash id elneo-room--seen)))
-                     (when (and msg (plist-get msg :is-own)
-                                (plist-get msg :sender-name))
-                       (throw 'name (plist-get msg :sender-name))))))))
+         (roster (and uid
+                      (plist-get (cl-find uid elneo-room--members
+                                          :key (lambda (member)
+                                                 (plist-get member :user-id))
+                                          :test #'equal)
+                                 :name)))
+         (name (or roster
+                   (catch 'name
+                     (dolist (id (reverse (elneo-room--ordered-event-ids)))
+                       (let ((msg (gethash id elneo-room--seen)))
+                         (when (and msg (plist-get msg :is-own)
+                                    (plist-get msg :sender-name))
+                           (throw 'name (plist-get msg :sender-name)))))))))
     (cons (or uid "me")
           (or name
               (and uid
@@ -4970,6 +4983,11 @@ restored to the draft (see `elneo-room--send-failed')."
               ;; rendered, the provisional is a duplicate now.
               (elneo-room--remove-message pending-id)
             (plist-put msg :pending nil)
+            ;; The provisional may have been named from the localpart
+            ;; fallback before the roster came back; the roster, once
+            ;; there, is what the daemon names the echo by, and the
+            ;; echo never replaces this block (the event id is taken).
+            (plist-put msg :sender-name (cdr (elneo-room--own-sender)))
             (elneo-room--replace-message pending-id msg event-id)
             ;; `elneo-room--last-event-id' must name a real event —
             ;; read receipts go to the server with it, and a
@@ -5847,21 +5865,34 @@ side cannot know the sender's avatar mxc or the decryption-time
 trust snapshot — and the ack's re-key keeps it that way.  When the
 daemon's real echo then finds the event already rendered, these
 are the fields it fills; anything the local echo already knows
-(:ts, body, sender name) is never overwritten.")
+(:ts, body) is never overwritten.  The sender name is the one
+exception, corrected outside this list (see
+`elneo-room--fill-echo-fields').")
 
 (defun elneo-room--fill-echo-fields (event-id stored echo)
-  "Fill STORED's unknown avatar/trust fields from the daemon ECHO.
+  "Fill STORED's unknown fields from the daemon ECHO.
 STORED is the seen-table entry EVENT-ID already renders — a
-re-keyed provisional block.  plist-put cannot be relied on to
-mutate when a key is absent, so a filled copy goes back into the
-seen table.  Returns t when anything changed (the caller
-re-renders; the avatar cell then also kicks the deduped fetch)."
+re-keyed provisional block.  Avatar and trust fill only when
+missing; an own message's sender name is taken over when it
+differs, because the local echo can only guess it: with the room's
+roster not fetched yet it fell back to the user id's localpart,
+while the daemon resolves the `m.room.member' name a bridge sets.
+plist-put cannot be relied on to mutate when a key is absent, so a
+filled copy goes back into the seen table.  Returns t when
+anything changed (the caller re-renders; the avatar cell then also
+kicks the deduped fetch)."
   (let ((updated stored) (changed nil))
     (dolist (key elneo-room--echo-fill-keys)
       (let ((echo (plist-get echo key)))
         (when (and echo (not (plist-get stored key)))
           (setq updated (plist-put updated key echo)
                 changed t))))
+    (let ((name (plist-get echo :sender-name)))
+      (when (and name
+                 (plist-get stored :is-own)
+                 (not (equal name (plist-get stored :sender-name))))
+        (setq updated (plist-put updated :sender-name name)
+              changed t)))
     (when (and changed (not (eq updated stored)))
       (puthash event-id updated elneo-room--seen))
     changed))

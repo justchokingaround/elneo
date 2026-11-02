@@ -233,6 +233,71 @@ its markers exist as after a first-page render."
                         nil)))
         (kill-buffer buf))))
 
+  ;; The own name for a provisional block comes from the room's own
+  ;; roster entry first: a bridge may set a room-local
+  ;; `m.room.member' name, and the daemon names its echoes from it.
+  ;; A rendered own message is only the fallback — it can carry an
+  ;; older guess (the user id's localpart) and then poison every
+  ;; later send in the buffer.
+  (let ((buf (mx-send-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (setq-local elneo-room--members
+                      '((:user-id "@me:hs" :name "choky")
+                        (:user-id "@a:hs" :name "Ann")))
+          ;; The history's own message is named "Me"; the roster wins.
+          (let ((elneo-accounts mx-accounts))
+            (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub))
+              (elneo-room--send-text "who am i")
+              (mx-check "roster: provisional takes the room's own name"
+                        (plist-get (gethash "$~pending-1" elneo-room--seen)
+                                   :sender-name)
+                        "choky")
+              (mx-check "roster: block renders that name"
+                        (and (progn (mx-find-line "choky")
+                                    (search-forward "who am i"
+                                                    (line-end-position) t))
+                             t)
+                        t))))
+      (kill-buffer buf)))
+
+  ;; Roster not fetched when the send went out (fire-and-forget, so
+  ;; this is a real race): the block is named by the fallback, and
+  ;; the late echo — the daemon's own resolution of the name —
+  ;; corrects it in place instead of leaving the guess on screen.
+  (let ((buf (mx-send-setup)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq mx-req 0 mx-sent nil)
+          (setq-local elneo-room--members nil)
+          (let ((elneo-accounts mx-accounts))
+            (cl-letf (((symbol-function 'elneo-send-message) #'mx-send-stub))
+              (elneo-room--send-text "rename me")
+              (mx-check "rename: fallback name first"
+                        (plist-get (gethash "$~pending-1" elneo-room--seen)
+                                   :sender-name)
+                        "Me")
+              (mx-ack (car mx-sent)
+                      '((@req . 1) (@ok . t) (event_id . "$real:nm")))
+              (elneo-room--on-new-message
+               '(:profile "mxtest" :room-id "!room" :event-id "$real:nm"
+                 :sender "@me:hs" :sender-name "choky" :ts 1700000300000
+                 :msgtype "m.text" :is-own t :body "rename me"))
+              (mx-check "rename: echo name taken over"
+                        (plist-get (gethash "$real:nm" elneo-room--seen)
+                                   :sender-name)
+                        "choky")
+              (mx-check "rename: one copy, no duplicate"
+                        (mx-occurrences "rename me") 1)
+              (mx-check "rename: block renders the echo name"
+                        (and (progn (mx-find-line "choky")
+                                    (search-forward "rename me"
+                                                    (line-end-position) t))
+                             t)
+                        t))))
+      (kill-buffer buf)))
+
   ;; Echo-before-ack: the sync echo renders the real message, the ack
   ;; then drops the provisional duplicate.
   (let ((buf (mx-send-setup)))
