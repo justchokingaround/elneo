@@ -6425,10 +6425,15 @@ pub async fn handle_send_attachment(
         .unwrap_or(fallback_name)
         .to_owned();
 
-    let mut config = matrix_sdk::attachment::AttachmentConfig::new();
-    if let Some(info) = carried {
-        config = config.info(attachment_info(&content_type, info));
-    }
+    // The size is always declared — the bytes are in hand.  Without it
+    // receivers that fetch an animation whole only when its declared
+    // size fits (elneo's inline GIF/WebP playback, `size' checked
+    // before any download) showed every image sent from here as a
+    // still thumbnail.  A carried size (a forward) wins.
+    let mut info = carried.unwrap_or_default();
+    info.size.get_or_insert(data.len() as u64);
+    let mut config = matrix_sdk::attachment::AttachmentConfig::new()
+        .info(attachment_info(&content_type, info));
     if let Some(root) = thread_root.as_deref() {
         // Threaded attachment (MSC3440): a plain thread send, no reply
         // leg — the media content carries no relation of its own, so
