@@ -96,7 +96,10 @@ explicit per-buffer override (`T' in the room) keep theirs."
      elneo-room-bar-cycle-preview :transient t)
     ("v" (lambda () (format "Avatar column: %s"
                             (if elneo-room-bar-avatars "on" "off")))
-     elneo-room-bar-toggle-avatars :transient t)]
+     elneo-room-bar-toggle-avatars :transient t)
+    ("C" (lambda () (format "Control buttons: %s"
+                            (if elneo-room-bar-show-controls "shown" "hidden")))
+     elneo-room-bar-toggle-controls :transient t)]
    ["Filter"
     ("a" (lambda () (format "Account filter: %s"
                             (elneo-transient--account-label)))

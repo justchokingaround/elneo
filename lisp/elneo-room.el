@@ -3024,30 +3024,85 @@ buffer text, so an untouched draft still counts as empty on send."
                        'face 'elneo-room-input-placeholder
                        'cursor t)))))))
 
+(defun elneo-room--separator-fit (head hints)
+  "Join HEAD and as many of HINTS as fit the room window on one line.
+HEAD (\"draft\", \"reply to X\", ...) always stays; hints are dropped
+from the end until the line fits, so a narrow window (a side-by-side
+split, a small frame) shows a shorter separator instead of one that
+soft-wraps onto a second line.  A HEAD too long on its own is cut
+with an ellipsis.  The width is the buffer's window, re-fitted on
+resize by `elneo-room--separator-resize'."
+  (let* ((win (get-buffer-window (current-buffer) t))
+         ;; One column short: a line exactly the window's width wraps
+         ;; where the fringe holds the continuation glyph.
+         (width (if win (1- (window-max-chars-per-line win)) 80))
+         (line (lambda (hs)
+                 (concat "── " head
+                         (if hs (concat ": " (string-join hs " · ")) "")
+                         " ──")))
+         (hints (copy-sequence hints)))
+    (while (and hints (> (string-width (funcall line hints)) width))
+      (setq hints (butlast hints)))
+    (let ((text (funcall line hints)))
+      (if (> (string-width text) width)
+          (truncate-string-to-width text (max 1 width) nil nil "…")
+        text))))
+
 (defun elneo-room--separator-text ()
   "Current separator line text (without the trailing newline)."
   (cond
    (elneo-room--reply-to
-    (format "── reply to %s%s: RET sends · C-j newline · C-c C-k cancels ──"
-            ;; Anon mode fakes the name; the reply target's event id
-            ;; resolves the mxid (the fake keyed on it matches the
-            ;; message line), falling back to the name itself.
-            (if elneo-anon-mode
-                (let ((parent (gethash elneo-room--reply-to
-                                       elneo-room--seen)))
-                  (elneo-anon--person (and parent (plist-get parent :sender))
-                                      elneo-room--reply-sender))
-              elneo-room--reply-sender)
-            ;; The send sorts into the target's thread when it names
-            ;; one (the separator is the only place the room view
-            ;; shows it ahead of the send).
-            (let ((parent (gethash elneo-room--reply-to
-                                   elneo-room--seen)))
-              (if (and parent (plist-get parent :thread-root))
-                  " (in thread)" ""))))
+    (elneo-room--separator-fit
+     (format "reply to %s%s"
+             ;; Anon mode fakes the name; the reply target's event id
+             ;; resolves the mxid (the fake keyed on it matches the
+             ;; message line), falling back to the name itself.
+             (if elneo-anon-mode
+                 (let ((parent (gethash elneo-room--reply-to
+                                        elneo-room--seen)))
+                   (elneo-anon--person (and parent (plist-get parent :sender))
+                                       elneo-room--reply-sender))
+               elneo-room--reply-sender)
+             ;; The send sorts into the target's thread when it names
+             ;; one (the separator is the only place the room view
+             ;; shows it ahead of the send).
+             (let ((parent (gethash elneo-room--reply-to
+                                    elneo-room--seen)))
+               (if (and parent (plist-get parent :thread-root))
+                   " (in thread)" "")))
+     '("RET sends" "C-c C-k cancels" "C-j newline")))
    (elneo-room--edit-to
-    "── editing message: RET sends · C-j newline · C-c C-k cancels ──")
-   (t "── draft: RET sends · C-j newline · C-c C-a attach · C-c C-v paste · C-c C-d dired ──")))
+    (elneo-room--separator-fit
+     "editing message" '("RET sends" "C-c C-k cancels" "C-j newline")))
+   ;; Hints in order of importance: the tail goes first when narrow.
+   (t (elneo-room--separator-fit
+       "draft" '("RET sends" "C-j newline" "C-c C-a attach"
+                 "C-c C-v paste" "C-c C-d dired")))))
+
+(defun elneo-room--separator-resize (frame)
+  "Re-fit the separator of room buffers shown on FRAME to their width.
+On `window-size-change-functions'; only rewrites a line whose fitted
+text changed, so a resize that keeps the same hints costs nothing."
+  (dolist (win (window-list frame 'no-minibuf))
+    (let ((buffer (window-buffer win)))
+      (when (provided-mode-derived-p
+             (buffer-local-value 'major-mode buffer) 'elneo-room-mode)
+        (with-current-buffer buffer
+          (when (and (markerp elneo-room--input-beg)
+                     (marker-buffer elneo-room--input-beg)
+                     (> (elneo-room--input-beg-pos) (point-min))
+                     (not (equal (save-excursion
+                                   (goto-char (elneo-room--input-beg-pos))
+                                   (buffer-substring-no-properties
+                                    (line-beginning-position 0)
+                                    (line-end-position 0)))
+                                 (elneo-room--separator-text))))
+            (elneo-room--update-separator)))))))
+
+(add-hook 'window-size-change-functions #'elneo-room--separator-resize)
+;; A room first rendered off-screen was fitted to the 80-column
+;; fallback; showing it in a window re-fits it.
+(add-hook 'window-buffer-change-functions #'elneo-room--separator-resize)
 
 (defun elneo-room--update-separator ()
   "Rewrite the separator line to match the current reply state."

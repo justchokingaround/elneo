@@ -115,6 +115,16 @@ case of avatars off, or a person with no avatar set."
 `below' puts it on a second line in `elneo-room-bar-preview'
 style, `inline' on the room's row, `none' hides it.")
 
+(defcustom elneo-room-bar-show-controls nil
+  "Non-nil means the wide bar starts with its rows of control buttons.
+Off by default: every control is a bar key and in the options menu
+\(`m'), and the buttons cost the top of the room list.  While hidden,
+only the rows that need attention stay: an unverified session's
+[Verify] and a daemon that isn't synced.  `C' in the bar toggles this
+for the session."
+  :type 'boolean
+  :group 'elneo-ui)
+
 (defcustom elneo-room-bar-avatars t
   "Non-nil means each room row starts with an avatar column.
 The room's avatar image, fetched through the thumbnail path and
@@ -225,6 +235,13 @@ follows the glyph by itself (see the comment on
   "Face for the room bar's control row."
   :group 'elneo-ui)
 
+(defface elneo-room-bar-active
+  '((t :inherit button :inverse-video t :weight bold))
+  "Face for the controls-row button whose filter is in effect.
+The ordinary button inverted, so the active one stands out while
+keeping the bracketed shape of its neighbours."
+  :group 'elneo-ui)
+
 (defface elneo-room-bar-section
   '((t :weight bold :inherit shadow))
   "Face for per-account section headers in grouped view.
@@ -325,6 +342,7 @@ process is gone (``offline''), or it is alive but cannot sync
         (define-key map (kbd "G") #'elneo-room-bar-toggle-grouped)
         (define-key map (kbd "p") #'elneo-room-bar-cycle-preview)
         (define-key map (kbd "v") #'elneo-room-bar-toggle-avatars)
+        (define-key map (kbd "C") #'elneo-room-bar-toggle-controls)
         (define-key map (kbd "l") #'elneo-room-bar-toggle-live-sort)
         (define-key map (kbd "w") #'elneo-room-bar-toggle-state)
         (define-key map (kbd "k") #'elneo-room-bar-cycle-click-action)
@@ -1046,8 +1064,8 @@ row group tracking) to hold on to across re-renders."
               (insert "\n")
               (dolist (room (append (elneo-room-bar--invites) rooms))
                 (elneo-room-bar--put-row room)))
-          (elneo-room-bar--insert-controls)
-          (insert "\n")
+          (when (elneo-room-bar--insert-controls)
+            (insert "\n"))
           ;; The Invites section rides on top of either view when invites
           ;; are configured to show together (see
           ;; `elneo-room-invite-display'): a pseudo-key header like the
@@ -1176,109 +1194,147 @@ decision, not a fault, and gets no chip."
 argument), PROPS as further text properties (face, help-echo)."
   (apply #'insert-text-button label 'action action props))
 
+(defun elneo-room-bar--controls-width ()
+  "Columns the controls rows may fill: the bar window's, else its default.
+One short of the window: the bar truncates lines, and a button
+ending in the last column loses its closing bracket to the `$'
+truncation glyph."
+  (let ((win (and (buffer-live-p elneo-room-bar--buffer)
+                  (get-buffer-window elneo-room-bar--buffer t))))
+    (1- (if win (window-max-chars-per-line win) (elneo-room-bar--width)))))
+
+(defun elneo-room-bar--insert-button-rows (rows)
+  "Insert ROWS of controls buttons, each wrapped to the bar's width.
+A row is a list of buttons (LABEL ACTION . PROPS) or plain strings
+(inserted as is, glued to the previous button).  A row's buttons go
+on one line while they fit and flow onto the next line at a button
+boundary otherwise — the bar truncates lines, so a row wider than
+the window used to lose its last button to the edge.  Every line
+starts in column 0, so all rows share one left edge."
+  (let ((width (elneo-room-bar--controls-width))
+        (first-row t))
+    (dolist (row rows)
+      (unless first-row (insert "\n"))
+      (setq first-row nil)
+      (let ((col 0))
+        (dolist (item row)
+          (if (stringp item)
+              (progn (insert item) (cl-incf col (string-width item)))
+            (let ((w (string-width (car item))))
+              (cond
+               ((zerop col))
+               ((> (+ col 1 w) width) (insert "\n") (setq col 0))
+               (t (insert " ") (cl-incf col)))
+              (apply #'insert-text-button (car item) 'action (cadr item)
+                     (cddr item))
+              (cl-incf col w))))))))
+
 (defun elneo-room-bar--insert-controls ()
   "Insert the controls rows: account buttons, then sorting/layout.
-Two rows, because a side window never fits one line of buttons:
-row one is the instance filter (plus the search state), row two the
-sorting and display modes.  Everything here is also reachable from
-the `elneo-transient' menu (`m' in the bar)."
-  (let ((inhibit-read-only t))
+Row one is the fold handle and the instance filter, row two search
+\(plus its state) and the sorting and display modes, then verification and daemon chips when
+there are any; each wraps at a button boundary when the bar is too
+narrow for it (see `elneo-room-bar--insert-button-rows').
+Everything here is also reachable from the `elneo-transient' menu
+\(`m' in the bar).  With `elneo-room-bar-show-controls' off only the
+verify and unsynced-daemon rows are left, often none.  Returns non-nil
+when anything was inserted."
+  (let ((inhibit-read-only t)
+        (on (lambda (active) (if active 'elneo-room-bar-active 'button)))
+        rows)
     ;; Row one starts with the fold handle: a stable corner tap target
     ;; (top-left), mirrored by the expand » at the top of the rail —
-    ;; both sides of the toggle are always one tap away.
-    (insert-text-button "[«]"
-                        'help-echo "w: fold the bar to the rail"
-                        'action (lambda (_) (elneo-room-bar-toggle-state)))
-    (insert " ")
-    ;; Row one: instance filter buttons, then the search state.
-    ;; The active filter carries the header face; the other controls
-    ;; render as the ordinary blue button link type — an explicit
-    ;; `button' face, identical to the category face an unfaced
-    ;; button inherits (passing nil or an empty face would paint the
-    ;; default foreground instead).
-    (insert-text-button "[All]"
-                        'face (if elneo-room-bar-account-filter
-                                  'button
-                                'elneo-room-bar-header)
-                        'action (lambda (_) (elneo-room-bar-set-account nil)))
-    (dolist (profile (elneo-room-bar--account-list))
-      (insert " ")
-      (insert-text-button (format "[%s]" (elneo-room-bar--tag profile))
-                          'face (if (equal elneo-room-bar-account-filter profile)
-                                    'elneo-room-bar-header
-                                  'button)
-                          'action (lambda (_) (elneo-room-bar-set-account profile))))
-    (insert " ")
-    (insert-text-button "[Srch]"
-                        'action (lambda (_) (call-interactively
-                                             #'elneo-room-bar-set-search)))
-    (when (> (length elneo-room-bar-search) 0)
-      (insert " “" elneo-room-bar-search "”"))
-    (insert "\n")
-    ;; Row two: sorting and display modes.
-    (insert-text-button (format "[Sort:%s]"
-                                (elneo-room-bar-sort-label
-                                 elneo-room-bar-sort t))
-                        'action (lambda (_) (elneo-room-bar-cycle-sort)))
-    (insert " ")
-    (insert-text-button (if elneo-room-bar-grouped "[Grp]" "[Mix]")
-                        'action (lambda (_) (elneo-room-bar-toggle-grouped)))
-    (insert " ")
-    (insert-text-button (pcase elneo-room-bar-dm-filter
-                          ('dm "[DMs]")
-                          ('rooms "[NoDMs]")
-                          (_ "[DM+]"))
-                        'face (if elneo-room-bar-dm-filter
-                                  'elneo-room-bar-header
-                                'button)
-                        'help-echo "d: cycle the direct-message filter"
-                        'action (lambda (_) (elneo-room-bar-cycle-dm)))
-    (insert " ")
-    (insert-text-button (format "[Prev:%s]"
-                                (pcase elneo-room-bar-preview-style
-                                  ('inline "inl") ('below "2nd") (_ "off")))
-                        'action (lambda (_) (elneo-room-bar-cycle-preview)))
-    (insert " ")
-    (insert-text-button (if elneo-room-bar-avatars "[Av:on]" "[Av:off]")
-                        'action (lambda (_) (elneo-room-bar-toggle-avatars)))
-    ;; Third row — only when one of the accounts has cross-signing
+    ;; both sides of the toggle are always one tap away.  Then the
+    ;; instance filter buttons.  The active
+    ;; filter is the same button inverted (`elneo-room-bar-active'),
+    ;; so it keeps the shape of its neighbours; the others carry an
+    ;; explicit `button' face, identical to the category face an
+    ;; unfaced button inherits (passing nil or an empty face would
+    ;; paint the default foreground instead).
+    (when elneo-room-bar-show-controls
+    (push (append
+           (list (list "[«]" (lambda (_) (elneo-room-bar-toggle-state))
+                       'help-echo "w: fold the bar to the rail")
+                 (list "[All]" (lambda (_) (elneo-room-bar-set-account nil))
+                       'face (funcall on (not elneo-room-bar-account-filter))))
+           (mapcar (lambda (profile)
+                     (list (format "[%s]" (elneo-room-bar--tag profile))
+                           (lambda (_) (elneo-room-bar-set-account profile))
+                           'face (funcall on (equal elneo-room-bar-account-filter
+                                                    profile))))
+                   (elneo-room-bar--account-list)))
+          rows)
+    ;; Row two: search (with its state), sorting and display modes.
+    ;; Search sits here, not on row one: the account buttons fill a
+    ;; side window's width, and [Srch] alone on a wrapped line looked
+    ;; like a stray.
+    (push (append
+           (list (list "[Srch]" (lambda (_) (call-interactively
+                                              #'elneo-room-bar-set-search))
+                       'face 'button))
+           (when (> (length elneo-room-bar-search) 0)
+             (list (concat " “" elneo-room-bar-search "”")))
+           (list
+           (list (format "[Sort:%s]" (elneo-room-bar-sort-label
+                                      elneo-room-bar-sort t))
+                 (lambda (_) (elneo-room-bar-cycle-sort)) 'face 'button)
+           (list (if elneo-room-bar-grouped "[Grp]" "[Mix]")
+                 (lambda (_) (elneo-room-bar-toggle-grouped)) 'face 'button)
+           (list (pcase elneo-room-bar-dm-filter
+                   ('dm "[DMs]") ('rooms "[NoDMs]") (_ "[DM+]"))
+                 (lambda (_) (elneo-room-bar-cycle-dm))
+                 'face (funcall on elneo-room-bar-dm-filter)
+                 'help-echo "d: cycle the direct-message filter")
+           (list (format "[Prev:%s]" (pcase elneo-room-bar-preview-style
+                                       ('inline "inl") ('below "2nd") (_ "off")))
+                 (lambda (_) (elneo-room-bar-cycle-preview)) 'face 'button)
+           (list (if elneo-room-bar-avatars "[Av:on]" "[Av:off]")
+                 (lambda (_) (elneo-room-bar-toggle-avatars)) 'face 'button)))
+          rows))
+    ;; Verify row — only when one of the accounts has cross-signing
     ;; enabled but this session does not yet trust it.  An account
     ;; that never bootstrapped (its only device) shows nothing: there
     ;; is no session worth nagging into a setup flow.  The button is
     ;; the shortcut into `elneo-session-status', which carries the
-    ;; actual verify/remove UI.
+    ;; actual verify/remove UI.  From the trust alist itself: an
+    ;; untrusted account with no rooms still needs its row, and row
+    ;; one ignores the filter too.
     (when-let* ((untrusted (cl-remove-if-not
                             (lambda (row) (and (eq (car (cdr row)) t)
                                                (not (cdr (cdr row)))))
                             (when (boundp 'elneo-server--trust)
                               elneo-server--trust))))
-      (insert "\n")
-      ;; From the trust alist itself: an untrusted account with no
-      ;; rooms still needs its row, and row one ignores the filter too.
-      (dolist (row untrusted)
-        (insert " ")
-        (elneo-room-bar--control-button
-         (format "[Verify: %s]" (elneo-room-bar--tag (car row)))
-         (lambda (_) (elneo-session-status (car row)))
-         'face 'elneo-room-bar-unverified)))
+      (push (mapcar (lambda (row)
+                      (list (format "[Verify: %s]" (elneo-room-bar--tag (car row)))
+                            (lambda (_) (elneo-session-status (car row)))
+                            'face 'elneo-room-bar-unverified))
+                    untrusted)
+            rows))
     ;; Daemon status row, folded with the degraded-state chips: one
     ;; glyph per daemon — ● synced (success face), ◐ connecting,
     ;; ✗ down — whole chip in `elneo-room-bar-offline' when down.
-    ;; Click restarts the daemon, dead or merely wedged.  Chips stay
-    ;; on one row: two accounts is the realistic maximum.
-    (let ((chips (elneo-room-bar--daemon-chips)))
-      (when chips
-        (insert "\n")
-        (dolist (chip chips)
-          (insert " ")
-          (insert-text-button
-           (format "[%s %s]" (nth 2 chip) (elneo-room-bar--tag (car chip)))
-           'face (nth 3 chip)
-           'help-echo (format "%s daemon: %s%s — click to restart"
-                              (car chip)
-                              (nth 1 chip)
-                              (if (nth 4 chip) (concat ": " (nth 4 chip)) ""))
-           'action (lambda (_) (elneo-restart-server (car chip)))))))))
+    ;; Click restarts the daemon, dead or merely wedged.
+    (when-let* ((chips (if elneo-room-bar-show-controls
+                           (elneo-room-bar--daemon-chips)
+                         ;; Hidden controls: only the daemons that
+                         ;; need a look (connecting or down).
+                         (cl-remove "synced" (elneo-room-bar--daemon-chips)
+                                    :key #'cadr :test #'equal))))
+      (push (mapcar (lambda (chip)
+                      (list (format "[%s %s]" (nth 2 chip)
+                                    (elneo-room-bar--tag (car chip)))
+                            (lambda (_) (elneo-restart-server (car chip)))
+                            'face (nth 3 chip)
+                            'help-echo (format "%s daemon: %s%s — click to restart"
+                                               (car chip) (nth 1 chip)
+                                               (if (nth 4 chip)
+                                                   (concat ": " (nth 4 chip))
+                                                 ""))))
+                    chips)
+            rows))
+    (when rows
+      (elneo-room-bar--insert-button-rows (nreverse rows))
+      t)))
 
 (defconst elneo-room-bar--sort-table
   '((activity "activity" "Act")
@@ -1504,6 +1560,12 @@ nothing to mark yet."
           ('inline 'below)
           ('below 'none)
           (_ 'inline)))
+  (elneo-room-bar-refresh-full))
+
+(defun elneo-room-bar-toggle-controls ()
+  "Show or hide the control buttons at the top of the wide bar."
+  (interactive)
+  (setq elneo-room-bar-show-controls (not elneo-room-bar-show-controls))
   (elneo-room-bar-refresh-full))
 
 (defun elneo-room-bar-toggle-avatars ()
