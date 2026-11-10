@@ -232,9 +232,12 @@
   ;; The controls row exposes the DM filter state: [DM+] when showing
   ;; everything (no face change), [DMs] when DMs only, [NoDMs] for
   ;; the rooms-only filter, carrying the state faces like row one.
+  ;; The buttons are hidden by default (C toggles them), so the test
+  ;; turns them on.
   (let ((buf (generate-new-buffer " *mx-bar-dmctl*")))
     (unwind-protect
-        (let ((elneo-room-bar--buffer buf))
+        (let ((elneo-room-bar--buffer buf)
+              (elneo-room-bar-show-controls t))
           (with-current-buffer buf
             (let (elneo-room-bar-dm-filter)
               (elneo-room-bar--insert-controls)
@@ -255,13 +258,16 @@
   ;; The filter buttons' faces: an inactive control shows as the
   ;; ordinary blue button link type — the explicit `button' face,
   ;; which is what an unfaced button inherits — and the ACTIVE
-  ;; filter's button carries the header face.  (Passing an explicit
-  ;; empty face would paint the default foreground instead; a
-  ;; `face nil' property overrides the button category entirely, so
-  ;; the face prop must be a real face in both states.)
+  ;; filter's button carries `elneo-room-bar-active' (the button
+  ;; inverted).  (Passing an explicit empty face would paint the
+  ;; default foreground instead; a `face nil' property overrides the
+  ;; button category entirely, so the face prop must be a real face
+  ;; in both states.)  Controls are hidden by default: turn them on.
   (let ((buf (generate-new-buffer " *mx-bar-faces*")))
     (unwind-protect
-        (let ((elneo-room-bar--buffer buf) (got nil))
+        (let ((elneo-room-bar--buffer buf)
+              (elneo-room-bar-show-controls t)
+              (got nil))
           (with-current-buffer buf
             (goto-char (point-min))
             (let (elneo-room-bar-account-filter elneo-room-bar-dm-filter)
@@ -284,12 +290,12 @@
               (goto-char (point-min))
               (search-forward "[DMs]")
               (nconc got (list (get-char-property (match-beginning 0) 'face)))))
-          ;; Default: the "All" view is the active one (header face),
-          ;; the DM filter is not (blue button).  Filtered: inverted.
-          (mx-check "control faces: inactive blue, active header"
+          ;; Default: the "All" view is the active one (inverted),
+          ;; the DM filter is not (blue button).  Filtered: swapped.
+          (mx-check "control faces: inactive blue, active inverted"
                     got
-                    (list 'elneo-room-bar-header 'button
-                          'button 'elneo-room-bar-header)))
+                    (list 'elneo-room-bar-active 'button
+                          'button 'elneo-room-bar-active)))
       (kill-buffer buf)))
 
   ;; Mouse-1 on a room row: point always moves to the click, the room
@@ -518,6 +524,88 @@
                               header-pt)))))
           (kill-buffer buf)))))
 
+  ;; The view restore: a re-render keeps the visible part of the list
+  ;; where it was.  At the head of the list it must keep the head —
+  ;; anchoring the window on the row it used to show left each newly
+  ;; arrived room (live sort bumps it above that row) out of sight
+  ;; above the window's top edge, one more row hidden on every message
+  ;; until the bar showed the middle of the list.
+  (let ((stub-rooms
+         (cl-loop for i from 1 to 30
+                  collect (list :profile "a" :room-id (format "!r%d" i)
+                                :display-name (format "R%d" i)
+                                :preview "hi" :unread 0 :highlights 0
+                                :last-activity (- 1000 i))))
+        (window (selected-window)))
+    (cl-letf (((symbol-function 'elneo-rooms-shown)
+               (lambda () (append stub-rooms nil)))
+              ((symbol-function 'elneo-rooms-all)
+               (lambda () (append stub-rooms nil))))
+      (let ((buf (generate-new-buffer " *mx-bar-view*")))
+        (unwind-protect
+            (let ((elneo-room-bar--buffer buf)
+                  (elneo-room-bar--markers (make-hash-table :test 'equal)))
+              (set-window-buffer window buf)
+              (elneo-room-bar-refresh-full)
+              (let ((marker (lambda (id)
+                              (gethash (cons "a" id)
+                                       elneo-room-bar--markers))))
+                ;; `--head-p' is what the render calls: a start at or
+                ;; inside the first row group is the head (nothing to
+                ;; anchor to), past it the list is scrolled down.
+                (mx-check "view: the buffer start is the head"
+                          (with-current-buffer buf
+                            (elneo-room-bar--head-p (point-min)))
+                          t)
+                (mx-check "view: a start inside the first row is still the head"
+                          (with-current-buffer buf
+                            (goto-char (point-min))
+                            (elneo-room-bar--head-p (1+ (point))))
+                          t)
+                (mx-check "view: a scrolled start is not the head"
+                          (with-current-buffer buf
+                            (elneo-room-bar--head-p
+                             (marker-position (funcall marker "!r5"))))
+                          nil)
+                ;; Head: an arrival bumps every row down one, and the
+                ;; window keeps its head, so the arrival is on screen.
+                (with-current-buffer buf
+                  (set-window-start window (point-min))
+                  (set-window-point window (point-min)))
+                (push (list :profile "a" :room-id "!new" :display-name "New"
+                            :preview "hi" :unread 1 :highlights 0
+                            :last-activity 9999)
+                      stub-rooms)
+                (elneo-room-bar-refresh-full)
+                (mx-check "view: at the head, the window stays at the head"
+                          (window-start window)
+                          (with-current-buffer buf (point-min)))
+                (mx-check "view: at the head, the arrival stays visible"
+                          (>= (marker-position (funcall marker "!new"))
+                              (window-start window))
+                          t)
+                ;; Scrolled down: the row the window showed stays the
+                ;; top row (the arrival lands above it, out of view).
+                (let ((anchor (marker-position (funcall marker "!r10"))))
+                  (with-current-buffer buf
+                    (set-window-start window anchor)
+                    (set-window-point window
+                                      (marker-position (funcall marker "!r14"))))
+                  (push (list :profile "a" :room-id "!newer" :display-name "Newer"
+                              :preview "hi" :unread 1 :highlights 0
+                              :last-activity 9998)
+                        stub-rooms)
+                  (elneo-room-bar-refresh-full)
+                  (mx-check "view: scrolled, the anchor row stays on top"
+                            (window-start window)
+                            (marker-position (funcall marker "!r10")))
+                  (mx-check "view: scrolled, the arrival stays above the top"
+                            (< (marker-position (funcall marker "!newer"))
+                               (window-start window))
+                            t))))
+          (set-window-buffer window (other-buffer buf))
+          (kill-buffer buf)))))
+
   ;; The visibility toggle: b from the options menu shows the bar
   ;; when it is hidden and hides it when it shows.
   (let ((buf (generate-new-buffer " *mx-bar-toggle*"))
@@ -572,11 +660,14 @@
               nil))
 
   ;; The bar's controls: a third row with a [Verify] button appears
-  ;; only for an enabled-but-untrusted session.
+  ;; only for an enabled-but-untrusted session.  The ordinary controls
+  ;; are hidden by default (`elneo-room-bar-show-controls': the "Av:"
+  ;; marker below checks that the usual rows are in), so turn them on.
   (let ((buf (generate-new-buffer " *mx-bar-trust*")))
     (unwind-protect
         (with-current-buffer buf
-          (let ((elneo-room-bar--buffer buf))
+          (let ((elneo-room-bar--buffer buf)
+                (elneo-room-bar-show-controls t))
             ;; Only the controls themselves matter here: no rooms in
             ;; the registry (the trust alist is the button source), no
             ;; re-render — this inserts direct.

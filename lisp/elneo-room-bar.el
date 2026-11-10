@@ -1035,17 +1035,35 @@ row group tracking) to hold on to across re-renders."
             "\n")
     (puthash key (copy-marker beg) elneo-room-bar--markers)))
 
+(defun elneo-room-bar--head-p (start)
+  "Non-nil when the bar's list begins at or below START (a buffer position).
+The view counts as at the head when at most the first row group sits
+above START: the list has not been scrolled down."
+  (with-current-buffer elneo-room-bar--buffer
+    (let ((first most-positive-fixnum)
+          (second most-positive-fixnum))
+      (maphash (lambda (_key marker)
+                 (let ((pos (and (markerp marker) (marker-buffer marker)
+                                 (marker-position marker))))
+                   (when pos
+                     (cond ((< pos first) (setq second first first pos))
+                           ((< pos second) (setq second pos))))))
+               elneo-room-bar--markers)
+      (< start second))))
+
 (defun elneo-room-bar-refresh-full ()
   "Re-render the whole room bar."
   (interactive)
   (elneo-room-bar--ensure)
   ;; Remember where the bar window's view sits (by room row), so the
-  ;; re-render does not yank the visible part of the list around.
+  ;; re-render does not yank the visible part of the list around — and
+  ;; whether that view is the head of the list (see below).
   (let* ((window (get-buffer-window elneo-room-bar--buffer (selected-frame)))
          (view (and window
                     (with-current-buffer elneo-room-bar--buffer
                       (list (get-text-property (window-point window) 'elneo-room-key)
-                            (get-text-property (window-start window) 'elneo-room-key))))))
+                            (get-text-property (window-start window) 'elneo-room-key)
+                            (elneo-room-bar--head-p (window-start window)))))))
     (with-current-buffer elneo-room-bar--buffer
       (let ((inhibit-read-only t)
             (rooms (elneo-room-bar--visible-rooms)))
@@ -1110,13 +1128,21 @@ row group tracking) to hold on to across re-renders."
               (elneo-room-bar--put-row room))))
         ;; Restore the view: point back on the room it was on, window top
         ;; back on its old top row (both fall back to the list start).
+        ;; At the head of the list the row is NOT the anchor: anchoring
+        ;; there put each newly arrived room (live sort bumps it to the
+        ;; row above the old top) out of sight above the window's top
+        ;; edge -- one more row hidden on every message, until the bar
+        ;; showed the middle of the list with the recent arrivals
+        ;; scrolled off the top.  The head stays the head.
         (when window
           (let ((point-marker (and (nth 0 view)
                                    (gethash (nth 0 view) elneo-room-bar--markers)))
                 (start-marker (and (nth 1 view)
                                    (gethash (nth 1 view) elneo-room-bar--markers))))
-            (set-window-start window (or (and start-marker (marker-position start-marker))
-                                         (point-min)))
+            (set-window-start window (if (nth 2 view)
+                                         (point-min)
+                                       (or (and start-marker (marker-position start-marker))
+                                           (point-min))))
             (set-window-point window (or (and point-marker (marker-position point-marker))
                                          (point-min)))))
         (set-buffer-modified-p nil)))))
