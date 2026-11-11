@@ -1440,8 +1440,18 @@ The same binding shape the `C-c ?' help window gives the render."
                         (with-temp-buffer
                           (insert text)
                           (goto-char (search-backward "mxc://hs/rav"))
-                          (backward-char 2)   ; start of the 2-col cell
-                          (eq (get-text-property (point) 'display) 'fake-img))
+                          ;; The cell is two columns wide but the
+                          ;; picture rides its first character only (the
+                          ;; rest is padding, so a narrow picture still
+                          ;; fills the columns), and the space before
+                          ;; the mxc string closes it.
+                          (let ((found nil))
+                            (dotimes (i 4)
+                              (when (eq (get-text-property (- (point) i)
+                                                           'display)
+                                        'fake-img)
+                                (setq found t)))
+                            found))
                         t)
               ;; The cell is a button too: clicking it opens the
               ;; full-size avatar view with the room's profile+mxc.

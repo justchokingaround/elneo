@@ -2666,20 +2666,62 @@ renders in many places and needs fetching once.")
     (unless (eq path 'failed) path)))
 
 (defun elneo-client--avatar-image (file &optional cols)
-  "Image spec for a downloaded avatar FILE, capped near COLS columns.
+  "Image spec for a downloaded avatar FILE, COLS columns wide.
 nil when FILE is nil or this Emacs cannot display images (terminal
 frame, batch): callers fall back to the mxc string or the initial
 cell.  FILE goes through `elneo--image-for-display' first, so an
 avatar in a format Emacs cannot decode converts to a PNG instead
 of staying an initial forever.  The bar's sender avatars and the
 avatar facts (room-overview, account page) build their cells from
-this, so one download renders identically everywhere."
+this, so one download renders identically everywhere.
+
+The picture keeps its aspect ratio inside the COLS-column, one
+display-line box, but its width is then snapped to a whole number
+of columns.  The display engine advances by the image's real pixel
+width: an avatar that came out 22px on a 15px column grid left the
+rest of its line floating one and a half columns off the grid, so
+the time and the sender name stood at a different x in every row
+whose sender had a picture than in the rows that showed a colored
+initial (which fills whole columns).  AVATAR-COLUMNS recovers the
+snapped column count for callers padding their cell."
   (when-let* ((file (and file (display-graphic-p)
                          (elneo--image-for-display file))))
-    (create-image
-     file nil nil
-     :max-height (default-font-height)
-     :max-width (* (or cols 2) (default-font-width)))))
+    (let* ((cols (or cols 2))
+           (cw (default-font-width))
+           (box-w (* cols cw))
+           (box-h (default-font-height))
+           ;; `:scale 1.0' keeps the automatic font-ratio bump off the
+           ;; arithmetic: with a font wider than 10px the display scales
+           ;; every image by the frame's factor, which would multiply
+           ;; the `:width'/`:height' below and throw the grid off again.
+           (natural (ignore-errors
+                      (image-size (create-image file nil nil :scale 1.0) t))))
+      (if (not natural)
+          ;; A frame that cannot measure the picture (batch, a display
+          ;; without this image type): nothing to snap, so cap it as
+          ;; before and let the caller's cell pad to whole columns.
+          (create-image file nil nil :scale 1.0
+                        :max-height (default-font-height)
+                        :max-width box-w)
+        (let* ((scale (min (/ (float box-w) (max 1 (car natural)))
+                           (/ (float box-h) (max 1 (cdr natural)))))
+               (width (round (* (car natural) scale)))
+               (columns (max 1 (min cols (round (/ (float width) cw)))))
+               (height (max 1 (min box-h
+                                   (round (* (cdr natural) scale))))))
+          (create-image file nil nil :scale 1.0
+                        :width (* columns cw) :height height))))))
+
+(defun elneo-client--avatar-columns (image)
+  "Columns avatar IMAGE spans on the selected frame's grid.
+Images are laid out by their pixel width, so 1 is the least this
+returns, and `elneo-client--avatar-image' makes it exact.  An image
+whose size cannot be told (batch, a spec the frame does not know)
+counts as the narrowest, which pads the cell out rather than
+letting the row come up short."
+  (let ((size (ignore-errors (image-size image t))))
+    (max 1 (round (/ (float (or (car-safe size) 0))
+                     (max 1 (default-font-width)))))))
 
 (defun elneo-client-fetch-image (profile mxc format callback cache pending)
   "Fetch image MXC as FORMAT through PROFILE's daemon, sharing CACHE.

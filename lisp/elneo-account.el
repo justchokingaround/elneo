@@ -113,7 +113,12 @@ profile facts as \"unknown\"."
                                 (elneo-client--avatar-image
                                  (elneo-client--avatar-file mxc) 4))))
             (insert-text-button
-             (propertize (make-string 4 ?\s) 'display img)
+             ;; Exactly four columns whatever the picture's shape: the
+             ;; image is snapped to whole columns
+             ;; (`elneo-client--avatar-image') and a narrow one padded.
+             (let ((used (elneo-client--avatar-columns img)))
+               (concat (propertize (make-string 1 ?\s) 'display img)
+                       (make-string (max 0 (- 4 used)) ?\s)))
              'action show 'help-echo "Show the avatar full-size")
             (insert " "))
           (if (and mxc (not (string-empty-p mxc)))

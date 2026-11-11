@@ -213,6 +213,24 @@ this default untouched."
   :type 'boolean
   :group 'elneo-room)
 
+(defcustom elneo-room-align-bottom t
+  "Keep the draft on the window's last line, blank space above the history.
+A room whose history is shorter than its window otherwise hangs
+from the top: the newest messages and the draft sit somewhere in
+the middle of the window, with dead space underneath, and opening
+the room, resizing it or the typing notice appearing meant hunting
+for the input again.  With this on, the content sits at the bottom
+like in every other chat client -- the newest message right above
+the draft, the blank space above the oldest one -- so the draft is
+always where it was.
+
+Display only: the pad is a stretch glyph in an overlay, never
+buffer text (a padding line inside the buffer would sit in the way
+of the backfill prepends, the read-only marking and the property
+walkers)."
+  :type 'boolean
+  :group 'elneo-room)
+
 (defcustom elneo-room-sender-colors t
   "Color other people's sender names, one stable color per user.
 The color derives from the Matrix user id (display-name changes do
@@ -930,6 +948,26 @@ Live messages are inserted there; it advances past inserted text.")
 (defvar-local elneo-room--input-beg nil
   "Buffer-local: marker at the start of the writable draft area.")
 
+(defvar-local elneo-room--bottom-pad nil
+  "Buffer-local: overlay padding a short room's top.
+Its `before-string' is one display line whose stretch glyph carries
+the height the content is short of its window --
+`elneo-room--bottom-pad-update' sets and removes it.")
+
+(defvar-local elneo-room--bottom-pad-height nil
+  "Buffer-local: pixel height of `elneo-room--bottom-pad'.
+Kept so an unchanged fit does not rebuild the overlay (and redraw
+its line) on every command.")
+
+(defvar-local elneo-room--bottom-pad-retry nil
+  "Buffer-local: state of the retry of a bottom-pad fit.
+`window-text-pixel-size' reports nothing for a window that has not
+drawn its buffer yet — right after a render, say — and hasty
+padding would push the room off the window.  `pending' is a retry
+scheduled for the first redisplay, `done' a retry that was already
+spent (no second try, so a window that never reports cannot loop),
+nil neither.")
+
 (define-derived-mode elneo-room-mode fundamental-mode "Matrix Room"
   "Major mode for a Matrix room buffer.
 The buffer ends in a writable input area: RET there sends the
@@ -1354,10 +1392,18 @@ never prefixed, and the draft area keeps the full window width."
 
 (defun elneo-room--avatar-image-cell (file)
   "Avatar-width image cell for a downloaded avatar FILE, or nil.
-nil when this Emacs cannot display images (terminal frame, batch)."
+nil when this Emacs cannot display images (terminal frame, batch).
+The cell displays exactly `elneo-room--avatar-width' columns: the
+image is snapped to whole columns (`elneo-client--avatar-image'),
+and a tall source picture that comes out a column narrower is
+padded with spaces, so rows keep the grid.  The number of characters
+the cell spans is therefore not fixed (a full-width picture is one,
+a narrow one two) -- consumers key on its display width, not its
+length."
   (when-let* ((image (elneo-client--avatar-image file elneo-room--avatar-width)))
-    (propertize (make-string elneo-room--avatar-width ?\s)
-                'display image)))
+    (let ((used (elneo-client--avatar-columns image)))
+      (concat (propertize (make-string 1 ?\s) 'display image)
+              (make-string (max 0 (- elneo-room--avatar-width used)) ?\s)))))
 
 (defun elneo-room--avatar-cell (msg)
   "The avatar prefix cell (with trailing space) for MSG.
@@ -1418,23 +1464,27 @@ so neither the window view nor any position after it can shift."
                            pos 'elneo-room-avatar-src nil limit)
                           limit))
           (let ((img (elneo-room--avatar-image-cell
-                      (elneo-client--avatar-file mxc))))
+                      (elneo-client--avatar-file mxc)))
+                ;; The src property covers exactly the placeholder cell;
+                ;; its length is not the cell's width (a downloaded
+                ;; picture can span a character less), so the cell ends
+                ;; where the property does.
+                (end (or (next-single-property-change
+                          pos 'elneo-room-avatar-src nil limit)
+                         limit)))
             (if (null img)
-                (setq pos (or (next-single-property-change
-                               pos 'elneo-room-avatar-src nil limit)
-                              limit))
-              ;; The src property covers exactly the placeholder cell;
-              ;; replace it with the equally wide image cell and keep
-              ;; the property, so a later pass skips it.  delete-region
+                (setq pos end)
+              ;; Replace it with the equally wide image cell and keep the
+              ;; property, so a later pass skips it.  delete-region
               ;; leaves point wherever it was — insert back at the
               ;; cell, not at point.
-              (delete-region pos (+ pos elneo-room--avatar-width))
+              (delete-region pos end)
               (save-excursion
                 (goto-char pos)
                 (insert (propertize img 'elneo-room-avatar-image t
                                     'elneo-room-avatar-src mxc
                                     'read-only t)))
-              (setq pos (+ pos elneo-room--avatar-width)))))))))
+              (setq pos (+ pos (length img))))))))))
 
 (defun elneo-room--strip-reply-fallback (body)
   "Strip a rich-reply fallback — leading \"> ...\" lines — from BODY.
@@ -1494,9 +1544,21 @@ the body indent; callers floor it to taste."
          80)
      (elneo-room--body-column)))
 
-(defun elneo-room--quote-width ()
-  "Columns available for quote text after the indent and marker."
-  (max 20 (- (elneo-room--body-width) 3)))
+(defun elneo-room--quote-width (name-width)
+  "Columns left for the quote text on a reply's name line.
+The quote shares that line with the time, the sender column and the
+parent's marker and name, so only what remains of the body width
+fits there.  Counting just the marker (as this did) let a longer
+quote run past the window edge: it soft-wrapped, the block's
+`wrap-prefix' pushed the tail under the body column, and one quote
+read as two lines — the second one indented like a message of its
+own.  NAME-WIDTH is the quoted sender's name in columns; one column
+stays free, the fringe's continuation slot, so the line cannot wrap
+by exactly one character.
+On a room not yet shown in a window the width falls back to 80
+columns; the render never runs off screen, and a later re-render
+refits."
+  (max 10 (- (elneo-room--body-width) 4 name-width 1)))
 
 (defcustom elneo-room-send-typing-notifications t
   "Non-nil: editing the draft tells the room you are typing.
@@ -1643,7 +1705,9 @@ the buffer's property layout (see
                       " ")
               (setq img-end (1- (point))))
           (insert (truncate-string-to-width
-                   text (elneo-room--quote-width) nil nil "…"))))))
+                   text (elneo-room--quote-width
+                         (string-width (elneo-room--sender-name parent)))
+                   nil nil "…"))))))
     (put-text-property beg (point) 'elneo-room-quote t)
     (put-text-property beg (point) 'elneo-room-reply-target reply-to)
     (put-text-property beg (point) 'face 'elneo-room-reply-quote-face)
@@ -3080,9 +3144,13 @@ resize by `elneo-room--separator-resize'."
                  "C-c C-v paste" "C-c C-d dired")))))
 
 (defun elneo-room--separator-resize (frame)
-  "Re-fit the separator of room buffers shown on FRAME to their width.
+  "Re-fit the separator and the bottom pad of rooms shown on FRAME.
 On `window-size-change-functions'; only rewrites a line whose fitted
-text changed, so a resize that keeps the same hints costs nothing."
+text changed, so a resize that keeps the same hints costs nothing.
+The bottom pad has to follow too: a new window height is a new free
+height under the draft, and a stale pad would push the content off
+the window (or leave the old gap under the draft) until the next
+command in the buffer."
   (dolist (win (window-list frame 'no-minibuf))
     (let ((buffer (window-buffer win)))
       (when (provided-mode-derived-p
@@ -3097,7 +3165,8 @@ text changed, so a resize that keeps the same hints costs nothing."
                                     (line-beginning-position 0)
                                     (line-end-position 0)))
                                  (elneo-room--separator-text))))
-            (elneo-room--update-separator)))))))
+            (elneo-room--update-separator))
+          (elneo-room--bottom-pad-update win))))))
 
 (add-hook 'window-size-change-functions #'elneo-room--separator-resize)
 ;; A room first rendered off-screen was fitted to the 80-column
@@ -5577,9 +5646,111 @@ scroll that last (writable) line out of the window again."
     (max (point-min) (point))))
 
 (defun elneo-room--window-at-end-p (window)
-  "Non-nil when WINDOW shows the end of this buffer (the draft area)."
+  "Non-nil when WINDOW shows the end of this buffer (the draft area).
+A bottom-aligned room counts as at its end: the pad shows the whole
+buffer from `point-min', with the draft on the window's last line --
+where `pos-visible-in-window-p' can refuse the last pixel row."
   (with-selected-window window
-    (pos-visible-in-window-p (point-max))))
+    (or (pos-visible-in-window-p (point-max))
+        (and (overlayp elneo-room--bottom-pad)
+             (= (window-start window) (point-min))))))
+
+;;; Bottom alignment: the draft on the window's last line
+
+(defun elneo-room--bottom-pad-clear ()
+  "Remove this buffer's bottom-alignment pad."
+  (when (overlayp elneo-room--bottom-pad)
+    (delete-overlay elneo-room--bottom-pad))
+  (setq elneo-room--bottom-pad nil
+        elneo-room--bottom-pad-height nil))
+
+(defun elneo-room--bottom-pad-update (window)
+  "Pad this buffer's top so its content ends on WINDOW's last line.
+The draft is the buffer's last line, so the pad is simply what the
+content is short of WINDOW's text area: the pad line then pushes
+everything down, the draft lands on the window's bottom edge and the
+dead space goes above the oldest message (`elneo-room-align-bottom').
+The measurement is in pixels, so wrapped lines, pictures and a
+multi-line draft all count, and the fit stays exact at any width.
+No pad when the history already fills WINDOW: less than a line of
+slack is not worth a stretch glyph that could overshoot.  Returns
+the pad height when it padded, nil otherwise."
+  (with-current-buffer (window-buffer window)
+    (if (not (and elneo-room-align-bottom
+                  (window-live-p window)
+                  elneo-room--backfilled
+                  (markerp elneo-room--input-beg)
+                  (marker-buffer elneo-room--input-beg)
+                  (> (elneo-room--input-beg-pos) (point-min))
+                  ;; Cheap rejection for a long room: more logical lines
+                  ;; than the window holds leaves no room for a pad, and
+                  ;; measuring every line is the expensive part.
+                  (<= (count-lines (point-min) (point-max))
+                      (window-body-height window))))
+        (elneo-room--bottom-pad-clear)
+      ;; Overlay strings are not part of this measurement, so the pad
+      ;; already in place does not have to come out first.
+      (let* ((body (window-body-height window t))
+             (lines (count-lines (point-min) (point-max)))
+             (content (cdr (window-text-pixel-size
+                            window (point-min) (point-max))))
+             ;; A window that has not drawn this buffer yet measures
+             ;; nothing (or a line or two): every logical line is at
+             ;; least one line tall, so a smaller height is no
+             ;; measurement at all.  Padding by it would push the
+             ;; whole room off the window.
+             (drawn (> content (/ (* lines (frame-char-height)) 2)))
+             ;; A pixel of slack: with the draft's last pixel row
+             ;; exactly on the window edge `pos-visible-in-window-p'
+             ;; calls the draft hidden, and the redisplay scrolls a
+             ;; line away.
+             (height (and drawn (- body content 1))))
+        (cond
+         ((not drawn)
+          (elneo-room--bottom-pad-clear)
+          ;; Retry once the first redisplay has laid the buffer out.
+          ;; A timer, never a redisplay of our own: this also runs from
+          ;; `window-size-change-functions', in the middle of one.
+          (when (null elneo-room--bottom-pad-retry)
+            (setq elneo-room--bottom-pad-retry 'pending)
+            (let ((buffer (current-buffer)))
+              (run-with-timer
+               0.05 nil
+               (lambda ()
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (when (eq elneo-room--bottom-pad-retry 'pending)
+                       (setq elneo-room--bottom-pad-retry 'done)
+                       (when-let* ((win (get-buffer-window buffer t)))
+                         (elneo-room--bottom-pad-update win)))))))))
+          nil)
+         ((not (> height (frame-char-height)))
+          (elneo-room--bottom-pad-clear)
+          nil)
+         (t
+          (setq elneo-room--bottom-pad-retry nil)
+          (unless (and (overlayp elneo-room--bottom-pad)
+                       (overlay-buffer elneo-room--bottom-pad)
+                       (equal height elneo-room--bottom-pad-height))
+            (elneo-room--bottom-pad-clear)
+            (setq elneo-room--bottom-pad (make-overlay (point-min) (point-min))
+                  elneo-room--bottom-pad-height height)
+            (overlay-put elneo-room--bottom-pad 'before-string
+                         (concat (propertize
+                                  " " 'display (list 'space :height height))
+                                 "\n")))
+          height))))))
+
+(defun elneo-room--bottom-pad-refresh ()
+  "Re-fit the bottom pad after a command in the room buffer.
+The draft grows and shrinks as it is typed (`C-j' especially), which
+changes the free height of a room that fit its window; the pad has
+to follow or the draft would leave room underneath again.  Only a
+view whose start is the buffer start can have one."
+  (when-let* ((window (get-buffer-window (current-buffer) t)))
+    (when (or (eq (window-start window) (point-min))
+              (overlayp elneo-room--bottom-pad))
+      (elneo-room--bottom-pad-update window))))
 
 (defun elneo-room--show-end (&optional window keep-point)
   "Scroll WINDOW (default: this buffer's window) to the end.
@@ -5599,22 +5770,28 @@ end on every live append."
       (unless (and keep-point
                    (>= (window-point window) (elneo-room--input-beg-pos)))
         (set-window-point window (point-max)))
-      (let ((start (elneo-room--end-start window)))
-        (set-window-start window start)
-        ;; Wrapped history lines make the logical-line count in
-        ;; `elneo-room--end-start' underestimate the real (visual)
-        ;; window height: walk the start forward until the buffer end
-        ;; — the draft — is actually on screen.
-        (save-excursion
-          (while (and (< start (point-max))
-                      (not (pos-visible-in-window-p (point-max) window)))
-            (goto-char start)
-            (forward-line 1)
-            (if (<= (point) start)
-                ;; Cannot advance (last line): bail out rather than spin.
-                (setq start (point-max))
-              (setq start (point))
-              (set-window-start window start))))))))
+      (if (elneo-room--bottom-pad-update window)
+          ;; Bottom-aligned: the pad already makes the content fill the
+          ;; window from its first line, so start there.  The line
+          ;; arithmetic below would count the pad line as a line and
+          ;; scroll the top of the pad away again.
+          (set-window-start window (point-min))
+        (let ((start (elneo-room--end-start window)))
+          (set-window-start window start)
+          ;; Wrapped history lines make the logical-line count in
+          ;; `elneo-room--end-start' underestimate the real (visual)
+          ;; window height: walk the start forward until the buffer end
+          ;; — the draft — is actually on screen.
+          (save-excursion
+            (while (and (< start (point-max))
+                        (not (pos-visible-in-window-p (point-max) window)))
+              (goto-char start)
+              (forward-line 1)
+              (if (<= (point) start)
+                  ;; Cannot advance (last line): bail out rather than spin.
+                  (setq start (point-max))
+                (setq start (point))
+                (set-window-start window start)))))))))
 
 (defun elneo-room--restore-anchor (event-id window)
   "Reposition WINDOW so the message EVENT-ID sits at the top.
@@ -5759,6 +5936,7 @@ imports) must not yank it out of mid-draft typing."
           (prev-history-retries elneo-room--history-retries))
       (condition-case err
           (progn
+            (elneo-room--bottom-pad-clear)
             (let ((inhibit-read-only t))
               (erase-buffer))
             (setq elneo-room--seen (make-hash-table :test 'equal))
@@ -7924,6 +8102,7 @@ Covers point at `point-min' (M-<) and `window-start' at `point-min'
   "Post-command maintenance: placeholder, pages, media, read marks."
   (elneo-room--maybe-autocomplete-mention)
   (elneo-room--update-draft-placeholder)
+  (elneo-room--bottom-pad-refresh)
   (elneo-room--draft-maybe-save)
   (elneo-room--maybe-load-older)
   (elneo-room--maybe-mark-read (selected-window))

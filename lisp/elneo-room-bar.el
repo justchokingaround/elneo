@@ -722,11 +722,16 @@ Differing from the current value triggers a rebuild.")
 
 (defun elneo-room-bar--avatar-image (file)
   "Avatar-width image cell for a downloaded room avatar FILE, or nil.
-nil when this Emacs cannot display images (terminal frame, batch)."
+nil when this Emacs cannot display images (terminal frame, batch).
+Exactly `elneo-room-bar--avatar-width' columns wide whatever the
+picture's shape, so the room names stay in their column: the image
+is snapped to whole columns (`elneo-client--avatar-image') and a
+narrow one padded out."
   (when-let* ((image (elneo-client--avatar-image
                       file elneo-room-bar--avatar-width)))
-    (propertize (make-string elneo-room-bar--avatar-width ?\s)
-                'display image)))
+    (let ((used (elneo-client--avatar-columns image)))
+      (concat (propertize (make-string 1 ?\s) 'display image)
+              (make-string (max 0 (- elneo-room-bar--avatar-width used)) ?\s)))))
 
 (defun elneo-room-bar--avatar-initial (room)
   "The initial-letter fallback avatar for ROOM, in a per-room color."
