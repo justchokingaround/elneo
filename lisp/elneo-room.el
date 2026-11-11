@@ -959,6 +959,12 @@ the height the content is short of its window --
 Kept so an unchanged fit does not rebuild the overlay (and redraw
 its line) on every command.")
 
+(defvar-local elneo-room--bottom-pad-pending nil
+  "Buffer-local: a bottom-pad re-fit is already scheduled.
+Buffer changes arrive in bursts (a render erases and refills the
+whole history, telega's ewoc does the same), so the fit waits for
+the idle moment after them instead of running for every change.")
+
 (defvar-local elneo-room--bottom-pad-retry nil
   "Buffer-local: state of the retry of a bottom-pad fit.
 `window-text-pixel-size' reports nothing for a window that has not
@@ -990,6 +996,13 @@ them the same way (tags into the draft, nothing sent until RET)."
   (add-hook 'post-command-hook #'elneo-room--post-command nil t)
   (add-hook 'kill-buffer-hook #'elneo-room--draft-kill-save nil t)
   (add-hook 'after-change-functions #'elneo-room--typing-after-change nil t)
+  (add-hook 'after-change-functions #'elneo-room--bottom-pad-schedule nil t)
+  ;; `window-state-change-functions' is called for every window showing
+  ;; this buffer that got added, resized or (de-)selected, with this
+  ;; buffer current even when the change came from another buffer's
+  ;; activity.  That is what keeps the draft on the window's last line
+  ;; without a command happening in the room.
+  (add-hook 'window-state-change-functions #'elneo-room--bottom-pad-window nil t)
   (add-hook 'kill-buffer-hook #'elneo-room--typing-stop nil t)
   ;; Spell-checking other people's messages is noise: opt out of plain
   ;; global-flyspell, and of any global `after-change-major-mode-hook'
@@ -5751,6 +5764,33 @@ view whose start is the buffer start can have one."
     (when (or (eq (window-start window) (point-min))
               (overlayp elneo-room--bottom-pad))
       (elneo-room--bottom-pad-update window))))
+
+(defun elneo-room--bottom-pad-window (window)
+  "On `window-state-change-functions': re-fit WINDOW's bottom pad.
+The state change includes the window being (de-)selected, resized or
+given this buffer while another buffer was current -- the frame
+being re-tiled under niri, a side window taking width away, the
+room bar redrawing -- so the pad follows the window and not only the
+commands typed in the room itself."
+  (elneo-room--bottom-pad-update window))
+
+(defun elneo-room--bottom-pad-schedule (&rest _)
+  "Ask for a bottom-pad re-fit at the next idle moment.
+New messages, a render and the draft all change the buffer between
+commands, and a room in a non-selected window is not reached by
+`post-command-hook' of the buffer the reader is in; the idle moment
+after the change re-fits every window showing this one."
+  (unless elneo-room--bottom-pad-pending
+    (setq elneo-room--bottom-pad-pending t)
+    (let ((buffer (current-buffer)))
+      (run-with-idle-timer
+       0.05 nil
+       (lambda ()
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (setq elneo-room--bottom-pad-pending nil)
+             (dolist (window (get-buffer-window-list buffer nil t))
+               (elneo-room--bottom-pad-update window)))))))))
 
 (defun elneo-room--show-end (&optional window keep-point)
   "Scroll WINDOW (default: this buffer's window) to the end.
