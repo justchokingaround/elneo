@@ -8931,20 +8931,14 @@ Non-image media opens as downloaded, untouched."
           (message "Matrix: could not download %s: %s"
                    name (elneo-server--error-string event)))))))
 
-(defun elneo-room--on-download-update (dl)
-  "Echo daemon download state changes, so long downloads stay visible.
-The download itself opens the file from its terminal response; this
-only tracks the daemon's `updateDownload' lifecycle events.
-Thumbnail downloads (inline images) are silent: they are numerous,
-short-lived, and failures surface as `[image unavailable]' on the
-placeholder itself."
-  (unless (string= (plist-get dl :format) "thumb")
-    (pcase (plist-get dl :state)
-      ("downloading"
-       (message "Matrix: downloading media..."))
-      ("error"
-       (message "Matrix: download failed: %s"
-                (or (plist-get dl :error) "unknown error"))))))
+;; No `elneo-download-update-hook' echo: every download the user starts
+;; (open, save, forward, voice, image viewer) already says "downloading
+;; NAME..." and reports its own failure from the terminal response.
+;; Everything else that comes through the hook is background work the
+;; user never asked for -- encrypted thumbnails and short animations
+;; fetched as "file", avatars -- and a generic "Matrix: downloading
+;; media..." for those just flickered over the echo area while scrolling
+;; or switching rooms.
 
 ;;; Sending
 
@@ -9238,7 +9232,6 @@ more than once."
 (add-hook 'elneo-edited-update-hook #'elneo-room--on-edited)
 (add-hook 'elneo-redaction-update-hook #'elneo-room--on-redaction)
 (add-hook 'elneo-room-keys-updated-hook #'elneo-room--on-keys-updated)
-(add-hook 'elneo-download-update-hook #'elneo-room--on-download-update)
 (add-hook 'elneo-room-update-hook #'elneo-room--on-pinned-update)
 
 (provide 'elneo-room)
