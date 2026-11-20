@@ -71,7 +71,7 @@ echo area regardless of this setting."
   :type 'boolean
   :group 'elneo)
 
-(defconst elneo-daemon-protocol 26
+(defconst elneo-daemon-protocol 27
   "Wire protocol version this Emacs side speaks.
 Not a setting — this names what this code implements, and must mirror
 the daemon's `PROTOCOL_VERSION' in server/src/protocol.rs: bump the two

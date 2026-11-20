@@ -888,6 +888,29 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
             Command::GetRoomSpaces { room_id } => {
                 sync::handle_get_room_spaces(self.inner.clone(), req, room_id).await
             }
+            Command::GetStickerPacks { room_id } => {
+                sync::handle_get_sticker_packs(self.inner.clone(), req, room_id).await
+            }
+            Command::SendSticker {
+                room_id,
+                url,
+                body,
+                info,
+                reply_to,
+                thread_root,
+            } => {
+                sync::handle_send_sticker(
+                    self.inner.clone(),
+                    req,
+                    room_id,
+                    url,
+                    body,
+                    info,
+                    reply_to,
+                    thread_root,
+                )
+                .await
+            }
             Command::AcceptInvite { room_id } => {
                 sync::handle_accept_invite(self.inner.clone(), req, room_id).await
             }

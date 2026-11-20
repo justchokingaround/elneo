@@ -69,7 +69,7 @@ package and is loaded only when configured.)"
   (let ((dir (file-name-directory (locate-library "elneo-client")))
         (failures nil))
     (dolist (file '("elneo-server" "elneo-client" "elneo-room"
-                    "elneo-image" "elneo-dired" "elneo-room-bar"
+                    "elneo-image" "elneo-dired" "elneo-sticker" "elneo-room-bar"
                     "elneo-account" "elneo-verify" "elneo-transient"))
       (condition-case err
           (load (expand-file-name (concat file ".el") dir) nil t)
@@ -2441,6 +2441,41 @@ joined — the room's own state is where the declarations live."
                       `((@type . "getRoomSpaces")
                         (room_id . ,room-id))
                       callback))
+
+(defun elneo-sticker-packs (profile room-id callback)
+  "Fetch the sticker packs usable in PROFILE's ROOM-ID (MSC2545).
+CALLBACK (PROFILE RESPONSE-EVENT) receives `stickerPacks' with
+`packs': a vector of pack alists (`id', `source' — \"room\", \"space\",
+\"user\" or \"global\" —, `name', optional `room_id', `room_name',
+`state_key', `avatar_url', and `stickers', a vector of alists with
+`shortcode', `url', `body' and optional `info').  The room's own
+packs come first, then its parent spaces', the personal pack and
+the packs enabled everywhere.  Needs protocol 27; older daemons
+answer `@ok' nil."
+  (elneo-server--call profile
+                      `((@type . "getStickerPacks")
+                        (room_id . ,room-id))
+                      callback))
+
+(defun elneo-send-sticker (profile room-id sticker callback
+                                   &optional reply-to thread-root)
+  "Send STICKER to PROFILE's ROOM-ID as an `m.sticker' event.
+STICKER is one alist of a `stickerPacks' pack's `stickers' (`url',
+`body', `info').  REPLY-TO and THREAD-ROOT work as in
+`elneo-send-message'.  CALLBACK (PROFILE RESPONSE-EVENT) gets the
+`updateSendResult'; the sticker itself arrives with the sync echo."
+  (let ((info (alist-get 'info sticker)))
+    (elneo-server--call profile
+                        `((@type . "sendSticker")
+                          (room_id . ,room-id)
+                          (url . ,(alist-get 'url sticker))
+                          (body . ,(or (alist-get 'body sticker)
+                                       (alist-get 'shortcode sticker)
+                                       "sticker"))
+                          ,@(when (consp info) `((info . ,info)))
+                          ,@(when reply-to `((reply_to . ,reply-to)))
+                          ,@(when thread-root `((thread_root . ,thread-root))))
+                        callback)))
 
 (defun elneo-leave-room (profile room-id callback)
   "Leave PROFILE's ROOM-ID.

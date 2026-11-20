@@ -67,7 +67,7 @@ use tracing::{debug, info, warn};
 use crate::daemon::SharedDaemon;
 use crate::protocol::{
     Event, HierarchyRoom, MediaEntry, MemberEntry, Mentions, MessageEntry, OutEvent, PollEntry,
-    PollOption, ReactionEntry, ReceiptEntry, RoomSummary, SendInfo,
+    PollOption, ReactionEntry, ReceiptEntry, RoomSummary, SendInfo, Sticker, StickerPack,
 };
 
 /// Aggregated reaction state: target event id -> key -> reaction event id ->
@@ -4191,7 +4191,11 @@ async fn dm_peer(room: &Room, is_direct: bool) -> Option<OwnedUserId> {
         .map(|h| h.user_id)
         .filter(|u| u != own)
         .collect();
-    if heroes.len() == 1 { heroes.pop() } else { None }
+    if heroes.len() == 1 {
+        heroes.pop()
+    } else {
+        None
+    }
 }
 
 /// The avatar mxc the bar shows for ROOM: its own `m.room.avatar`,
@@ -4971,6 +4975,50 @@ fn merge_space_parents(parents: Vec<(String, bool)>, extra: Vec<String>) -> Vec<
         .collect()
 }
 
+/// The parent spaces of ROOM (PARSED its id), canonical first: its own
+/// `m.space.parent` state, plus every joined space of this session
+/// whose `m.space.child` lists the room or one of its upgrade-chain ids
+/// (see [`handle_get_room_spaces`]).  Errs only when the room's own
+/// parent state cannot be read.
+async fn room_parent_ids(
+    client: &Client,
+    room: &Room,
+    parsed: &RoomId,
+) -> Result<Vec<(String, bool)>, String> {
+    let values = raw_state_values(
+        room.get_state_events("m.space.parent".into())
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    let mut parents = parent_ids_from_events(&values);
+    // The supplement: other clients decide space membership from the
+    // session's joined spaces' child state, and rooms migrated into a
+    // space by invite or through an upgrade chain may carry no own
+    // `m.space.parent` at all.  Every joined space whose child state
+    // lists the room or one of its chain members folds in.
+    let accept = room_chain_ids(client, parsed).await;
+    let found = join_all(client.joined_rooms().into_iter().map(|room| {
+        let accept = accept.clone();
+        let parsed = parsed.to_owned();
+        async move {
+            if !room.is_space() || room.room_id().as_str() == parsed.as_str() {
+                return None;
+            }
+            let listed = match room.get_state_events("m.space.child".into()).await {
+                Ok(events) => raw_state_values(events),
+                Err(_) => return None,
+            };
+            child_matches(&listed, &accept).then(|| room.room_id().to_string())
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    parents = merge_space_parents(parents, found);
+    Ok(parents)
+}
+
 /// One `getRoomSpaces` response: the `m.space.parent` state events a
 /// room carries (state_key = the parent's room id), canonical parent
 /// first — plus, folded in, every joined space of this session whose
@@ -5005,8 +5053,8 @@ pub(crate) async fn handle_get_room_spaces(
         ));
         return;
     };
-    let values = match room.get_state_events("m.space.parent".into()).await {
-        Ok(events) => raw_state_values(events),
+    let parents = match room_parent_ids(&client, &room, &parsed).await {
+        Ok(parents) => parents,
         Err(e) => {
             tracing::error!("getRoomSpaces {room_id} state read failed: {e}");
             daemon.send(OutEvent::ack(
@@ -5017,32 +5065,6 @@ pub(crate) async fn handle_get_room_spaces(
             return;
         }
     };
-    let mut parents = parent_ids_from_events(&values);
-    // The supplement: other clients decide space membership from the
-    // session's joined spaces' child state, and rooms migrated into a
-    // space by invite or through an upgrade chain may carry no own
-    // `m.space.parent` at all.  Every joined space whose child state
-    // lists the room or one of its chain members folds in.
-    let accept = room_chain_ids(&client, &parsed).await;
-    let found = join_all(client.joined_rooms().into_iter().map(|room| {
-        let accept = accept.clone();
-        let parsed = parsed.clone();
-        async move {
-            if !room.is_space() || room.room_id().as_str() == parsed.as_str() {
-                return None;
-            }
-            let listed = match room.get_state_events("m.space.child".into()).await {
-                Ok(events) => raw_state_values(events),
-                Err(_) => return None,
-            };
-            child_matches(&listed, &accept).then(|| room.room_id().to_string())
-        }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
-    parents = merge_space_parents(parents, found);
 
     let spaces = parents
         .iter()
@@ -5075,6 +5097,346 @@ pub(crate) async fn handle_get_room_spaces(
         req,
         Event::RoomSpaces { room_id, spaces },
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Stickers (MSC2545 image packs, `m.sticker`)
+// ---------------------------------------------------------------------------
+
+/// MSC2545 state event type of a room's image packs (state key = pack).
+const ROOM_PACK_TYPE: &str = "im.ponies.room_emotes";
+/// MSC2545 global account data: the account's personal pack.
+const USER_PACK_TYPE: &str = "im.ponies.user_emotes";
+/// MSC2545 global account data: room packs enabled everywhere,
+/// `{"rooms": {ROOM_ID: {STATE_KEY: {}}}}`.
+const EMOTE_ROOMS_TYPE: &str = "im.ponies.emote_rooms";
+
+/// Whether a pack image counts as a sticker.  MSC2545: an image's own
+/// `usage` wins, else the pack's; neither set (or an empty list) means
+/// both emoticon and sticker.
+fn usage_includes_sticker(
+    image: Option<&serde_json::Value>,
+    pack: Option<&serde_json::Value>,
+) -> bool {
+    let listed = |usage: Option<&serde_json::Value>| {
+        usage
+            .and_then(|u| u.as_array())
+            .filter(|u| !u.is_empty())
+            .map(|u| u.iter().any(|v| v.as_str() == Some("sticker")))
+    };
+    listed(image).or_else(|| listed(pack)).unwrap_or(true)
+}
+
+/// The stickers of one MSC2545 pack CONTENT (`images` + `pack`), as a
+/// [`StickerPack`] with the given identity, or `None` when the pack
+/// holds no sticker (an emoticon-only or emptied pack).  Images without
+/// an `mxc://` URL are skipped; the name falls back to FALLBACK_NAME
+/// when the pack has no `display_name`.
+fn sticker_pack_from(
+    content: &serde_json::Value,
+    id: String,
+    source: &str,
+    room: Option<(String, Option<String>, String)>,
+    fallback_name: String,
+) -> Option<StickerPack> {
+    let pack = content.get("pack");
+    let pack_usage = pack.and_then(|p| p.get("usage"));
+    let stickers: Vec<Sticker> = content
+        .get("images")
+        .and_then(|i| i.as_object())?
+        .iter()
+        .filter_map(|(shortcode, image)| {
+            let url = image.get("url")?.as_str()?;
+            if !url.starts_with("mxc://") || !usage_includes_sticker(image.get("usage"), pack_usage)
+            {
+                return None;
+            }
+            let body = image
+                .get("body")
+                .and_then(|b| b.as_str())
+                .filter(|b| !b.is_empty())
+                .unwrap_or(shortcode);
+            Some(Sticker {
+                shortcode: shortcode.clone(),
+                url: url.to_owned(),
+                body: body.to_owned(),
+                info: image.get("info").filter(|i| i.is_object()).cloned(),
+            })
+        })
+        .collect();
+    if stickers.is_empty() {
+        return None;
+    }
+    let name = pack
+        .and_then(|p| p.get("display_name"))
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or(fallback_name);
+    let avatar_url = pack
+        .and_then(|p| p.get("avatar_url"))
+        .and_then(|a| a.as_str())
+        .filter(|a| a.starts_with("mxc://"))
+        .map(str::to_owned);
+    let (room_id, room_name, state_key) = match room {
+        Some((id, name, key)) => (Some(id), name, Some(key)),
+        None => (None, None, None),
+    };
+    Some(StickerPack {
+        id,
+        source: source.to_owned(),
+        name,
+        room_id,
+        room_name,
+        state_key,
+        avatar_url,
+        stickers,
+    })
+}
+
+/// The (room id, state key) pairs `im.ponies.emote_rooms` CONTENT
+/// enables, in the content's order.
+fn emote_rooms_from(content: &serde_json::Value) -> Vec<(String, String)> {
+    content
+        .get("rooms")
+        .and_then(|r| r.as_object())
+        .into_iter()
+        .flatten()
+        .flat_map(|(room_id, keys)| {
+            keys.as_object()
+                .into_iter()
+                .flatten()
+                .map(move |(key, _)| (room_id.clone(), key.clone()))
+        })
+        .collect()
+}
+
+/// The sticker packs of one joined ROOM's `im.ponies.room_emotes`
+/// state, tagged SOURCE; WANT limits them to the listed state keys.
+/// SEEN dedupes across sources (a space pack also enabled globally
+/// shows once, under the first source that found it).
+async fn room_sticker_packs(
+    room: &Room,
+    source: &str,
+    want: Option<&HashSet<String>>,
+    seen: &mut HashSet<String>,
+) -> Vec<StickerPack> {
+    let room_id = room.room_id().to_string();
+    let room_name = room.name();
+    let values = room
+        .get_state_events(ROOM_PACK_TYPE.into())
+        .await
+        .map_or_else(|_| Vec::new(), raw_state_values);
+    values
+        .iter()
+        .filter_map(|ev| {
+            let key = ev.get("state_key")?.as_str()?.to_owned();
+            if want.is_some_and(|w| !w.contains(&key)) {
+                return None;
+            }
+            let id = format!("{room_id}/{key}");
+            if seen.contains(&id) {
+                return None;
+            }
+            let fallback = match (&room_name, key.is_empty()) {
+                (_, false) => key.clone(),
+                (Some(name), true) => name.clone(),
+                (None, true) => "Room pack".to_owned(),
+            };
+            let pack = sticker_pack_from(
+                ev.get("content")?,
+                id.clone(),
+                source,
+                Some((room_id.clone(), room_name.clone(), key)),
+                fallback,
+            )?;
+            seen.insert(id);
+            Some(pack)
+        })
+        .collect()
+}
+
+/// A global account data event's content: the store's copy first (it
+/// arrives with every sync), the homeserver's when the store has none.
+async fn global_account_data(client: &Client, event_type: &str) -> Option<serde_json::Value> {
+    let account = client.account();
+    let raw = match account.account_data_raw(event_type.into()).await {
+        Ok(Some(raw)) => Some(raw),
+        _ => account
+            .fetch_account_data(event_type.into())
+            .await
+            .ok()
+            .flatten(),
+    }?;
+    serde_json::from_str(raw.json().get()).ok()
+}
+
+/// `getStickerPacks`: every MSC2545 sticker pack usable in ROOM_ID —
+/// the room's own, its parent spaces' (Cinny and FluffyChat offer a
+/// space's packs in all its rooms), the personal pack, and the room
+/// packs enabled everywhere.  Rooms this session is not joined to are
+/// skipped: their state is not in the store.
+pub(crate) async fn handle_get_sticker_packs(
+    daemon: SharedDaemon,
+    req: Option<u64>,
+    room_id: String,
+) {
+    let Some((client, room)) = room_ctx(&daemon, req, &room_id).await else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    let mut packs = room_sticker_packs(&room, "room", None, &mut seen).await;
+
+    let parents = room_parent_ids(&client, &room, room.room_id())
+        .await
+        .unwrap_or_default();
+    for (parent, _) in parents {
+        if let Some(space) = room_of(&client, &parent) {
+            if space.state() == RoomState::Joined {
+                packs.extend(room_sticker_packs(&space, "space", None, &mut seen).await);
+            }
+        }
+    }
+
+    if let Some(content) = global_account_data(&client, USER_PACK_TYPE).await {
+        if let Some(pack) = sticker_pack_from(
+            &content,
+            "user".to_owned(),
+            "user",
+            None,
+            "Personal".to_owned(),
+        ) {
+            packs.push(pack);
+        }
+    }
+
+    if let Some(content) = global_account_data(&client, EMOTE_ROOMS_TYPE).await {
+        let mut by_room: Vec<(String, HashSet<String>)> = Vec::new();
+        for (rid, key) in emote_rooms_from(&content) {
+            match by_room.iter_mut().find(|(r, _)| *r == rid) {
+                Some((_, keys)) => {
+                    keys.insert(key);
+                }
+                None => by_room.push((rid, HashSet::from([key]))),
+            }
+        }
+        for (rid, keys) in by_room {
+            if let Some(source_room) = room_of(&client, &rid) {
+                packs.extend(
+                    room_sticker_packs(&source_room, "global", Some(&keys), &mut seen).await,
+                );
+            }
+        }
+    }
+
+    daemon.send(OutEvent::response(
+        req,
+        Event::StickerPacks { room_id, packs },
+    ));
+}
+
+/// The `m.relates_to` of a sent sticker: in a thread, the `m.thread`
+/// relation (with a genuine reply leg when REPLY_TO is set, else the
+/// no-threads fallback naming FOLD_LATEST, or the root); outside one,
+/// a plain reply to REPLY_TO.  `None` for a bare sticker.
+fn sticker_relation(
+    thread_root: Option<&str>,
+    reply_to: Option<&str>,
+    fold_latest: Option<&str>,
+) -> Option<serde_json::Value> {
+    match (thread_root, reply_to) {
+        (Some(root), Some(reply)) => Some(serde_json::json!({
+            "rel_type": "m.thread",
+            "event_id": root,
+            "is_falling_back": false,
+            "m.in_reply_to": {"event_id": reply},
+        })),
+        (Some(root), None) => Some(serde_json::json!({
+            "rel_type": "m.thread",
+            "event_id": root,
+            "is_falling_back": true,
+            "m.in_reply_to": {"event_id": fold_latest.unwrap_or(root)},
+        })),
+        (None, Some(reply)) => Some(serde_json::json!({
+            "m.in_reply_to": {"event_id": reply},
+        })),
+        (None, None) => None,
+    }
+}
+
+/// The content of an `m.sticker` event (`info` is required by the
+/// spec; an absent one goes out as `{}`).
+fn sticker_content(
+    url: &str,
+    body: &str,
+    info: Option<serde_json::Value>,
+    relation: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut content = serde_json::json!({
+        "body": body,
+        "url": url,
+        "info": info.filter(|i| i.is_object()).unwrap_or_else(|| serde_json::json!({})),
+    });
+    if let Some(rel) = relation {
+        content["m.relates_to"] = rel;
+    }
+    content
+}
+
+/// `sendSticker`: one `m.sticker` event with a pack image.  Pack
+/// images are plain media, so even an encrypted room's event only
+/// carries the MXC (that is what every other client sends too).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_send_sticker(
+    daemon: SharedDaemon,
+    req: Option<u64>,
+    room_id: String,
+    url: String,
+    body: String,
+    info: Option<serde_json::Value>,
+    reply_to: Option<String>,
+    thread_root: Option<String>,
+) {
+    if !url.starts_with("mxc://") {
+        daemon.send(OutEvent::ack(
+            req,
+            false,
+            Some(format!("Not an mxc:// URL: {url}")),
+        ));
+        return;
+    }
+    let Some((_, room)) = room_ctx(&daemon, req, &room_id).await else {
+        return;
+    };
+    let fold_latest = match &thread_root {
+        Some(root) if reply_to.is_none() => thread_fold_latest(&daemon, &room, root)
+            .await
+            .map(|id| id.to_string()),
+        _ => None,
+    };
+    let relation = sticker_relation(
+        thread_root.as_deref(),
+        reply_to.as_deref(),
+        fold_latest.as_deref(),
+    );
+    let content = sticker_content(&url, &body, info, relation);
+    match room.send_raw("m.sticker", content).await {
+        Ok(response) => daemon.send(OutEvent::response(
+            req,
+            Event::UpdateSendResult {
+                room_id,
+                event_id: Some(response.response.event_id.to_string()),
+            },
+        )),
+        Err(e) => {
+            tracing::error!("sendSticker failed: {}", e);
+            daemon.send(OutEvent::ack(
+                req,
+                false,
+                Some(format!("Sticker send failed: {e}")),
+            ));
+        }
+    }
 }
 
 /// One hierarchy row from the homeserver's JSON chunk (the flattened
@@ -6432,8 +6794,8 @@ pub async fn handle_send_attachment(
     // still thumbnail.  A carried size (a forward) wins.
     let mut info = carried.unwrap_or_default();
     info.size.get_or_insert(data.len() as u64);
-    let mut config = matrix_sdk::attachment::AttachmentConfig::new()
-        .info(attachment_info(&content_type, info));
+    let mut config =
+        matrix_sdk::attachment::AttachmentConfig::new().info(attachment_info(&content_type, info));
     if let Some(root) = thread_root.as_deref() {
         // Threaded attachment (MSC3440): a plain thread send, no reply
         // leg — the media content carries no relation of its own, so

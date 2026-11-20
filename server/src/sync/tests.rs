@@ -2056,3 +2056,118 @@ fn space_children_skip_removed_and_keyless() {
         vec!["!a:hs".to_string()]
     );
 }
+
+#[test]
+fn sticker_usage_follows_image_then_pack() {
+    use serde_json::json;
+    // Neither set: both kinds.
+    assert!(usage_includes_sticker(None, None));
+    assert!(usage_includes_sticker(Some(&json!([])), None));
+    // The pack's usage applies when the image has none.
+    assert!(!usage_includes_sticker(None, Some(&json!(["emoticon"]))));
+    assert!(usage_includes_sticker(
+        None,
+        Some(&json!(["emoticon", "sticker"]))
+    ));
+    // The image's own usage wins over the pack's.
+    assert!(usage_includes_sticker(
+        Some(&json!(["sticker"])),
+        Some(&json!(["emoticon"]))
+    ));
+    assert!(!usage_includes_sticker(
+        Some(&json!(["emoticon"])),
+        Some(&json!(["sticker"]))
+    ));
+}
+
+#[test]
+fn sticker_pack_keeps_stickers_only() {
+    use serde_json::json;
+    let content = json!({
+        "pack": {"display_name": "Cats", "avatar_url": "mxc://hs/av", "usage": ["sticker"]},
+        "images": {
+            "cat": {"url": "mxc://hs/cat", "body": "a cat", "info": {"w": 256, "h": 256}},
+            "smile": {"url": "mxc://hs/smile", "usage": ["emoticon"]},
+            "bad": {"url": "https://example.org/x.png"},
+            "bare": {"url": "mxc://hs/bare"}
+        }
+    });
+    let pack = sticker_pack_from(
+        &content,
+        "!s:hs/cats".into(),
+        "space",
+        Some(("!s:hs".into(), Some("Space".into()), "cats".into())),
+        "fallback".into(),
+    )
+    .unwrap();
+    assert_eq!(pack.name, "Cats");
+    assert_eq!(pack.avatar_url.as_deref(), Some("mxc://hs/av"));
+    assert_eq!(pack.room_id.as_deref(), Some("!s:hs"));
+    assert_eq!(pack.state_key.as_deref(), Some("cats"));
+    let codes: Vec<&str> = pack.stickers.iter().map(|s| s.shortcode.as_str()).collect();
+    assert_eq!(codes, vec!["bare", "cat"]);
+    // No body: the shortcode stands in; info rides along when present.
+    assert_eq!(pack.stickers[0].body, "bare");
+    assert_eq!(pack.stickers[0].info, None);
+    assert_eq!(pack.stickers[1].body, "a cat");
+    assert_eq!(pack.stickers[1].info, Some(json!({"w": 256, "h": 256})));
+
+    // An emoticon-only pack, and an emptied one, are no sticker packs.
+    let emotes = json!({"pack": {"usage": ["emoticon"]},
+                        "images": {"a": {"url": "mxc://hs/a"}}});
+    assert!(sticker_pack_from(&emotes, "x".into(), "user", None, "P".into()).is_none());
+    assert!(sticker_pack_from(&json!({}), "x".into(), "user", None, "P".into()).is_none());
+    // No display name: the fallback.
+    let plain = json!({"images": {"a": {"url": "mxc://hs/a"}}});
+    let pack = sticker_pack_from(&plain, "user".into(), "user", None, "Personal".into()).unwrap();
+    assert_eq!(pack.name, "Personal");
+    assert_eq!(pack.room_id, None);
+}
+
+#[test]
+fn emote_rooms_lists_room_and_key_pairs() {
+    use serde_json::json;
+    let content = json!({"rooms": {"!a:hs": {"": {}, "cats": {}}, "!b:hs": {"dogs": {}}}});
+    assert_eq!(
+        emote_rooms_from(&content),
+        vec![
+            ("!a:hs".to_owned(), "".to_owned()),
+            ("!a:hs".to_owned(), "cats".to_owned()),
+            ("!b:hs".to_owned(), "dogs".to_owned()),
+        ]
+    );
+    assert!(emote_rooms_from(&json!({})).is_empty());
+}
+
+#[test]
+fn sticker_content_carries_relations() {
+    use serde_json::json;
+    let bare = sticker_content("mxc://hs/c", "cat", None, None);
+    assert_eq!(
+        bare,
+        json!({"body": "cat", "url": "mxc://hs/c", "info": {}})
+    );
+
+    let reply = sticker_content(
+        "mxc://hs/c",
+        "cat",
+        Some(json!({"w": 1})),
+        sticker_relation(None, Some("$r:hs"), None),
+    );
+    assert_eq!(reply["info"], json!({"w": 1}));
+    assert_eq!(
+        reply["m.relates_to"],
+        json!({"m.in_reply_to": {"event_id": "$r:hs"}})
+    );
+
+    let plain_thread = sticker_relation(Some("$root:hs"), None, Some("$last:hs")).unwrap();
+    assert_eq!(plain_thread["rel_type"], "m.thread");
+    assert_eq!(plain_thread["is_falling_back"], true);
+    assert_eq!(plain_thread["m.in_reply_to"]["event_id"], "$last:hs");
+    let unfolded = sticker_relation(Some("$root:hs"), None, None).unwrap();
+    assert_eq!(unfolded["m.in_reply_to"]["event_id"], "$root:hs");
+
+    let thread_reply = sticker_relation(Some("$root:hs"), Some("$r:hs"), None).unwrap();
+    assert_eq!(thread_reply["is_falling_back"], false);
+    assert_eq!(thread_reply["m.in_reply_to"]["event_id"], "$r:hs");
+}

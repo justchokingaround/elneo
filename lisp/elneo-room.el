@@ -434,6 +434,9 @@ parent that is not loaded yet."
         ;; telega's attach-clipboard key: paste a screenshot as an
         ;; [image:] tag.
         (define-key map (kbd "C-c C-v") #'elneo-room-attach-clipboard)
+        ;; Stickers from the room's, its spaces' and your own MSC2545
+        ;; packs (elneo-sticker.el); telega's sticker key is C-c C-s too.
+        (define-key map (kbd "C-c C-s") #'elneo-sticker-pick)
         (define-key map (kbd "C-c C-c") #'elneo-room-send)
         (define-key map (kbd "<prior>") #'elneo-room-older)
         (define-key map (kbd "o") #'elneo-room--o)
@@ -504,6 +507,7 @@ parent that is not loaded yet."
         map))
 
 (defvar elneo-thread-mode-map)            ; elneo-thread.el, loaded after us
+(declare-function elneo-sticker-pick "elneo-sticker" ())
 
 (defun elneo-room--adopt-mode-map ()
   "Point open room buffers and the thread map at `elneo-room-mode-map'.

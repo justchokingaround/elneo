@@ -143,7 +143,15 @@ use serde::{Deserialize, Serialize};
 ///    clients ignore the event; old daemons answer `@ok: false`.
 ///    Space summaries gain `space_children` (the `m.space.child` room
 ///    ids), so clients can group and hide rooms by space.
-pub const PROTOCOL_VERSION: u32 = 26;
+/// 27: stickers.  `getStickerPacks` answers a `stickerPacks` event: the
+///    MSC2545 (`im.ponies.*`) image packs usable in a room — the room's
+///    own packs, its parent spaces' packs, the account's personal pack and
+///    the packs it enabled everywhere (`im.ponies.emote_rooms`), each
+///    filtered to the images whose usage includes "sticker".  `sendSticker`
+///    sends one as an `m.sticker` event (reply and thread relations as
+///    for text).  Old clients never send either; old daemons answer
+///    `@ok: false`, so the activation minimum stays put.
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// serde `skip_serializing_if` helper: false-valued createRoom flags
 /// (public, is_direct) stay off the wire — deserialization defaults
@@ -483,6 +491,29 @@ pub enum Command {
     /// this session's store (only a joined room's state can be read).
     #[serde(rename = "getRoomSpaces")]
     GetRoomSpaces { room_id: String },
+    /// The sticker packs usable in a joined room (MSC2545): responds
+    /// with a `stickerPacks` event.  Store-backed; a pack in a room
+    /// this session is not joined to cannot be read and is left out.
+    #[serde(rename = "getStickerPacks")]
+    GetStickerPacks { room_id: String },
+    /// Send an `m.sticker` event: URL is the image's MXC (pack images
+    /// are plain, unencrypted media, so the event only carries the
+    /// URL), BODY its text fallback, INFO the pack's `info` object.
+    /// Responds with an `updateSendResult`.
+    #[serde(rename = "sendSticker")]
+    SendSticker {
+        room_id: String,
+        url: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        info: Option<serde_json::Value>,
+        /// Event id this sticker replies to (`m.in_reply_to`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        /// Thread root (MSC3440), as for `sendMessage`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_root: Option<String>,
+    },
     /// Send a text message.  Responds with an `updateSendResult`
     /// carrying the homeserver's event id (a failed send is a bare
     /// `@ok: false` instead); the fields below cover reply, edit and
@@ -1006,6 +1037,41 @@ pub struct HierarchyRoom {
     pub via: Option<Vec<String>>,
 }
 
+/// One sticker of a [`StickerPack`]: the image's shortcode (the pack's
+/// key for it), its MXC, the body a sent `m.sticker` carries (the
+/// image's own `body`, the shortcode when it has none) and its
+/// `info` object as the pack stores it (`w`/`h`/`mimetype`/`size`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sticker {
+    pub shortcode: String,
+    pub url: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<serde_json::Value>,
+}
+
+/// One MSC2545 image pack, cut down to its stickers.  `source` says
+/// where it came from: "room" (the room's own `im.ponies.room_emotes`
+/// state), "space" (a parent space's), "user" (the account's
+/// `im.ponies.user_emotes`) or "global" (a room pack the account
+/// enabled everywhere via `im.ponies.emote_rooms`).  Room-backed packs
+/// name their room and state key; `id` is unique within one response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StickerPack {
+    pub id: String,
+    pub source: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    pub stickers: Vec<Sticker>,
+}
+
 /// One account device as listed for the verification picker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSummary {
@@ -1136,6 +1202,14 @@ pub enum Event {
     RoomSpaces {
         room_id: String,
         spaces: Vec<HierarchyRoom>,
+    },
+    /// The `getStickerPacks` response: the room's own packs first,
+    /// then its parent spaces', the personal pack, and the packs
+    /// enabled everywhere — deduplicated, empty packs left out.
+    #[serde(rename = "stickerPacks")]
+    StickerPacks {
+        room_id: String,
+        packs: Vec<StickerPack>,
     },
     /// The own account profile (the `getProfile` response): the
     /// homeserver's global display name and avatar mxc.  Both are
@@ -1790,6 +1864,38 @@ mod tests {
                     room_id: "!r:hs".into(),
                 },
                 json!({"@type": "getRoomSpaces", "room_id": "!r:hs"}),
+            ),
+            (
+                Command::GetStickerPacks {
+                    room_id: "!r:hs".into(),
+                },
+                json!({"@type": "getStickerPacks", "room_id": "!r:hs"}),
+            ),
+            (
+                Command::SendSticker {
+                    room_id: "!r:hs".into(),
+                    url: "mxc://hs/cat".into(),
+                    body: "cat".into(),
+                    info: None,
+                    reply_to: None,
+                    thread_root: None,
+                },
+                json!({"@type": "sendSticker", "room_id": "!r:hs",
+                       "url": "mxc://hs/cat", "body": "cat"}),
+            ),
+            (
+                Command::SendSticker {
+                    room_id: "!r:hs".into(),
+                    url: "mxc://hs/cat".into(),
+                    body: "cat".into(),
+                    info: Some(json!({"w": 256, "h": 256, "mimetype": "image/webp"})),
+                    reply_to: Some("$e:hs".into()),
+                    thread_root: Some("$root:hs".into()),
+                },
+                json!({"@type": "sendSticker", "room_id": "!r:hs",
+                       "url": "mxc://hs/cat", "body": "cat",
+                       "info": {"w": 256, "h": 256, "mimetype": "image/webp"},
+                       "reply_to": "$e:hs", "thread_root": "$root:hs"}),
             ),
             (
                 Command::SendMessage {
@@ -2591,6 +2697,34 @@ mod tests {
                 }),
             ),
             (
+                Event::StickerPacks {
+                    room_id: "!r:hs".into(),
+                    packs: vec![StickerPack {
+                        id: "!s:hs/cats".into(),
+                        source: "space".into(),
+                        name: "Cats".into(),
+                        room_id: Some("!s:hs".into()),
+                        room_name: Some("The Space".into()),
+                        state_key: Some("cats".into()),
+                        avatar_url: None,
+                        stickers: vec![Sticker {
+                            shortcode: "cat".into(),
+                            url: "mxc://hs/cat".into(),
+                            body: "cat".into(),
+                            info: Some(json!({"w": 256})),
+                        }],
+                    }],
+                },
+                json!({
+                    "@type": "stickerPacks", "room_id": "!r:hs",
+                    "packs": [{"id": "!s:hs/cats", "source": "space", "name": "Cats",
+                               "room_id": "!s:hs", "room_name": "The Space",
+                               "state_key": "cats",
+                               "stickers": [{"shortcode": "cat", "url": "mxc://hs/cat",
+                                             "body": "cat", "info": {"w": 256}}]}]
+                }),
+            ),
+            (
                 Event::Profile {
                     user_id: "@a:hs".into(),
                     display_name: Some("Alice".into()),
@@ -3157,7 +3291,7 @@ mod tests {
                     release: RELEASE_VERSION.into(),
                 },
                 json!({
-                    "@type": "daemonInfo", "protocol": 26,
+                    "@type": "daemonInfo", "protocol": 27,
                     "release": env!("CARGO_PKG_VERSION")
                 }),
             ),
