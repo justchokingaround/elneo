@@ -1322,6 +1322,36 @@ when anything was inserted."
            (list (if elneo-room-bar-avatars "[Av:on]" "[Av:off]")
                  (lambda (_) (elneo-room-bar-toggle-avatars)) 'face 'button)))
           rows))
+    ;; Hidden controls: an active filter still gets a row, one chip
+    ;; per filter, click to clear.  Without it a stray `a' or `d' (the
+    ;; bar's single-letter keys) silently dropped a whole account's
+    ;; rooms or every DM from the list, with nothing on screen saying
+    ;; so.
+    (unless elneo-room-bar-show-controls
+      (when-let* ((chips
+                   (delq nil
+                         (list
+                          (when elneo-room-bar-account-filter
+                            (list (format "[only %s ×]"
+                                          (elneo-room-bar--tag
+                                           elneo-room-bar-account-filter))
+                                  (lambda (_) (elneo-room-bar-set-account nil))
+                                  'face 'elneo-room-bar-active
+                                  'help-echo "a: cycle the account filter; click: all accounts"))
+                          (when elneo-room-bar-dm-filter
+                            (list (if (eq elneo-room-bar-dm-filter 'dm)
+                                      "[DMs only ×]" "[no DMs ×]")
+                                  (lambda (_)
+                                    (setq elneo-room-bar-dm-filter nil)
+                                    (elneo-room-bar-refresh-full))
+                                  'face 'elneo-room-bar-active
+                                  'help-echo "d: cycle the DM filter; click: everything"))
+                          (when (> (length elneo-room-bar-search) 0)
+                            (list (format "[“%s” ×]" elneo-room-bar-search)
+                                  (lambda (_) (elneo-room-bar-set-search ""))
+                                  'face 'elneo-room-bar-active
+                                  'help-echo "click: clear the search"))))))
+        (push chips rows)))
     ;; Verify row — only when one of the accounts has cross-signing
     ;; enabled but this session does not yet trust it.  An account
     ;; that never bootstrapped (its only device) shows nothing: there
@@ -1555,6 +1585,10 @@ nothing to mark yet."
            ((null current-index) (car accounts))
            ((= (1+ current-index) (length accounts)) nil)
            (t (nth (1+ current-index) accounts))))
+    (message "Matrix: room bar shows %s"
+             (if elneo-room-bar-account-filter
+                 (format "only %s's rooms" elneo-room-bar-account-filter)
+               "all accounts"))
     (elneo-room-bar-refresh-full)))
 
 (defun elneo-room-bar-cycle-dm ()
