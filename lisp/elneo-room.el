@@ -5536,6 +5536,16 @@ adds the explicit \"leave old too\" choice."
       (format "Invite to %s — [j]oin, [L]eave old too, [d]ecline, [i]gnore? " name)
     (format "Invite to %s — [j]oin, [d]ecline, [i]gnore? " name)))
 
+(defun elneo-room--invite-dead-p (event)
+  "Non-nil when the failed accept EVENT says the invite's room is empty.
+Synapse answers a join with \"no servers that are in the room\"
+when nobody is left in the room — the inviter left after inviting
+(heisenbridge does that with its network rooms).  Nobody can ever
+let us in again, so the invite is a zombie: only declining clears
+it, and retrying the join just fails the same way."
+  (string-match-p "no servers that are in the room"
+                  (or (elneo-server--error-string event) "")))
+
 (defun elneo-room-invite-prompt (room)
   "Offer the pending invite ROOM: join, decline or ignore.
 The choice is read in the echo area (j/d/i; anything else
@@ -5560,9 +5570,23 @@ does not skip the asking — the prompt is the ask."
             (elneo-accept-invite
              profile room-id
              (lambda (_profile event)
-               (if (not (alist-get '@ok event nil nil #'equal))
-                   (message "Matrix [room]: join failed — %s"
-                            (elneo-server--error-string event))
+               (cond
+                ;; A dead room: decline right away instead of leaving a
+                ;; row that can neither be joined nor goes away.
+                ((and (not (alist-get '@ok event nil nil #'equal))
+                      (elneo-room--invite-dead-p event))
+                 (elneo-decline-invite
+                  profile room-id
+                  (lambda (_p ack)
+                    (message
+                     (if (alist-get '@ok ack nil nil #'equal)
+                         "Matrix [room]: %s is empty (inviter left) — invite declined"
+                       "Matrix [room]: %s is empty, and declining failed too")
+                     name))))
+                ((not (alist-get '@ok event nil nil #'equal))
+                 (message "Matrix [room]: join failed — %s"
+                          (elneo-server--error-string event)))
+                (t
                  (let ((fresh (elneo-room-get profile room-id)))
                    (if fresh (elneo-room-open fresh)
                      (message "Matrix [room]: joined %s" name)))
@@ -5573,7 +5597,7 @@ does not skip the asking — the prompt is the ask."
                       (unless (alist-get '@ok ack nil nil #'equal)
                         (message
                          "Matrix [room]: leaving %s failed — %s"
-                         old (elneo-server--error-string ack))))))))))))
+                         old (elneo-server--error-string ack)))))))))))))
     (pcase
         (downcase
          (read-char (elneo-room--invite-prompt-string name old)))
