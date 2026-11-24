@@ -151,7 +151,16 @@ use serde::{Deserialize, Serialize};
 ///    sends one as an `m.sticker` event (reply and thread relations as
 ///    for text).  Old clients never send either; old daemons answer
 ///    `@ok: false`, so the activation minimum stays put.
-pub const PROTOCOL_VERSION: u32 = 27;
+/// 28: `getAllStickerPacks` answers an `allStickerPacks` event with every
+///    sticker pack of every joined room plus the personal and the
+///    everywhere-enabled ones.  `getStickerPacks` costs a request per
+///    room (and the client that searches wants them all at once), so a
+///    picker's search asked the daemon once per joined room; this is the
+///    same work in one store-backed pass.  Packs keep their ids;
+///    `source` is the room they live in ("room"), "user" or "global".
+///    Old daemons answer `@ok: false` on the wire word, so clients keep
+///    a fallback.
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// serde `skip_serializing_if` helper: false-valued createRoom flags
 /// (public, is_direct) stay off the wire — deserialization defaults
@@ -496,6 +505,12 @@ pub enum Command {
     /// this session is not joined to cannot be read and is left out.
     #[serde(rename = "getStickerPacks")]
     GetStickerPacks { room_id: String },
+    /// Every sticker pack this account can use anywhere: each joined
+    /// room's own packs, the personal pack and the ones enabled
+    /// everywhere.  Responds with an `allStickerPacks` event, one
+    /// store-backed pass (see protocol 28).
+    #[serde(rename = "getAllStickerPacks")]
+    GetAllStickerPacks,
     /// Send an `m.sticker` event: URL is the image's MXC (pack images
     /// are plain, unencrypted media, so the event only carries the
     /// URL), BODY its text fallback, INFO the pack's `info` object.
@@ -1211,6 +1226,11 @@ pub enum Event {
         room_id: String,
         packs: Vec<StickerPack>,
     },
+    /// The `getAllStickerPacks` response: every pack usable in any
+    /// joined room: the rooms' own packs, the personal pack and the
+    /// packs enabled everywhere, deduplicated, empty packs left out.
+    #[serde(rename = "allStickerPacks")]
+    AllStickerPacks { packs: Vec<StickerPack> },
     /// The own account profile (the `getProfile` response): the
     /// homeserver's global display name and avatar mxc.  Both are
     /// optional — an unset profile keeps its fields off the wire,
@@ -1870,6 +1890,10 @@ mod tests {
                     room_id: "!r:hs".into(),
                 },
                 json!({"@type": "getStickerPacks", "room_id": "!r:hs"}),
+            ),
+            (
+                Command::GetAllStickerPacks,
+                json!({"@type": "getAllStickerPacks"}),
             ),
             (
                 Command::SendSticker {
@@ -2725,6 +2749,10 @@ mod tests {
                 }),
             ),
             (
+                Event::AllStickerPacks { packs: Vec::new() },
+                json!({"@type": "allStickerPacks", "packs": []}),
+            ),
+            (
                 Event::Profile {
                     user_id: "@a:hs".into(),
                     display_name: Some("Alice".into()),
@@ -3291,7 +3319,7 @@ mod tests {
                     release: RELEASE_VERSION.into(),
                 },
                 json!({
-                    "@type": "daemonInfo", "protocol": 27,
+                    "@type": "daemonInfo", "protocol": 28,
                     "release": env!("CARGO_PKG_VERSION")
                 }),
             ),

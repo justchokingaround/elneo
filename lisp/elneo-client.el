@@ -2457,6 +2457,21 @@ answer `@ok' nil."
                         (room_id . ,room-id))
                       callback))
 
+(defun elneo-all-sticker-packs (profile callback)
+  "Fetch every sticker pack PROFILE can use anywhere (MSC2545).
+CALLBACK (PROFILE RESPONSE-EVENT) receives `allStickerPacks' with
+`packs': one vector of pack alists shaped exactly as
+`elneo-sticker-packs'' are: each joined room's own packs (a space is
+a room, so its packs come as its room's), the personal pack and the
+packs enabled everywhere, deduplicated.  A picker searching all of
+them wants them at once: this is one store-backed pass, where one
+`elneo-sticker-packs' per room costs a request (and a homeserver
+round trip) per room.  Needs protocol 28; older daemons answer
+`@ok' nil."
+  (elneo-server--call profile
+                      '((@type . "getAllStickerPacks"))
+                      callback))
+
 (defun elneo-send-sticker (profile room-id sticker callback
                                    &optional reply-to thread-root)
   "Send STICKER to PROFILE's ROOM-ID as an `m.sticker' event.

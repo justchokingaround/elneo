@@ -891,6 +891,9 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
             Command::GetStickerPacks { room_id } => {
                 sync::handle_get_sticker_packs(self.inner.clone(), req, room_id).await
             }
+            Command::GetAllStickerPacks => {
+                sync::handle_get_all_sticker_packs(self.inner.clone(), req).await
+            }
             Command::SendSticker {
                 room_id,
                 url,

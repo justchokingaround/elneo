@@ -5214,7 +5214,9 @@ fn emote_rooms_from(content: &serde_json::Value) -> Vec<(String, String)> {
 /// The sticker packs of one joined ROOM's `im.ponies.room_emotes`
 /// state, tagged SOURCE; WANT limits them to the listed state keys.
 /// SEEN dedupes across sources (a space pack also enabled globally
-/// shows once, under the first source that found it).
+/// shows once, under the first source that found it).  The room's
+/// name (a store walk of its own) is read only once a pack shows up:
+/// `getAllStickerPacks` walks every joined room and most have none.
 async fn room_sticker_packs(
     room: &Room,
     source: &str,
@@ -5222,11 +5224,11 @@ async fn room_sticker_packs(
     seen: &mut HashSet<String>,
 ) -> Vec<StickerPack> {
     let room_id = room.room_id().to_string();
-    let room_name = room.name();
     let values = room
         .get_state_events(ROOM_PACK_TYPE.into())
         .await
         .map_or_else(|_| Vec::new(), raw_state_values);
+    let mut room_name: Option<Option<String>> = None;
     values
         .iter()
         .filter_map(|ev| {
@@ -5238,7 +5240,15 @@ async fn room_sticker_packs(
             if seen.contains(&id) {
                 return None;
             }
-            let fallback = match (&room_name, key.is_empty()) {
+            let name = match &room_name {
+                Some(name) => name.clone(),
+                None => {
+                    let name = room.name();
+                    room_name = Some(name.clone());
+                    name
+                }
+            };
+            let fallback = match (&name, key.is_empty()) {
                 (_, false) => key.clone(),
                 (Some(name), true) => name.clone(),
                 (None, true) => "Room pack".to_owned(),
@@ -5247,7 +5257,7 @@ async fn room_sticker_packs(
                 ev.get("content")?,
                 id.clone(),
                 source,
-                Some((room_id.clone(), room_name.clone(), key)),
+                Some((room_id.clone(), name, key)),
                 fallback,
             )?;
             seen.insert(id);
@@ -5298,7 +5308,47 @@ pub(crate) async fn handle_get_sticker_packs(
         }
     }
 
-    if let Some(content) = global_account_data(&client, USER_PACK_TYPE).await {
+    packs.extend(account_sticker_packs(&client, &mut seen).await);
+
+    daemon.send(OutEvent::response(
+        req,
+        Event::StickerPacks { room_id, packs },
+    ));
+}
+
+/// `getAllStickerPacks`: every MSC2545 sticker pack of every joined
+/// room, plus the account's own (protocol 28).  The same corpus a
+/// client would collect with one `getStickerPacks` per room: the
+/// room's packs, its spaces' packs (a space is a room) and the ones
+/// enabled everywhere, in one store-backed pass, so a picker that
+/// searches all of them does not hammer the daemon (and the
+/// homeserver) once per room.
+pub(crate) async fn handle_get_all_sticker_packs(daemon: SharedDaemon, req: Option<u64>) {
+    let Some(client) = daemon.client().await else {
+        no_session(&daemon, req);
+        return;
+    };
+    // The account's packs first, so a globally enabled pack keeps its
+    // "global" label over the same pack's own room.
+    let mut seen = HashSet::new();
+    let mut packs = account_sticker_packs(&client, &mut seen).await;
+    for room in client.joined_rooms() {
+        if room.state() != RoomState::Joined {
+            continue;
+        }
+        packs.extend(room_sticker_packs(&room, "room", None, &mut seen).await);
+    }
+
+    daemon.send(OutEvent::response(req, Event::AllStickerPacks { packs }));
+}
+
+/// The account's own sticker packs, as `getStickerPacks` adds them:
+/// the personal pack and the room packs enabled everywhere ("user"
+/// and "global").  SEEN dedupes against the room packs already read.
+async fn account_sticker_packs(client: &Client, seen: &mut HashSet<String>) -> Vec<StickerPack> {
+    let mut packs = Vec::new();
+
+    if let Some(content) = global_account_data(client, USER_PACK_TYPE).await {
         if let Some(pack) = sticker_pack_from(
             &content,
             "user".to_owned(),
@@ -5310,7 +5360,7 @@ pub(crate) async fn handle_get_sticker_packs(
         }
     }
 
-    if let Some(content) = global_account_data(&client, EMOTE_ROOMS_TYPE).await {
+    if let Some(content) = global_account_data(client, EMOTE_ROOMS_TYPE).await {
         let mut by_room: Vec<(String, HashSet<String>)> = Vec::new();
         for (rid, key) in emote_rooms_from(&content) {
             match by_room.iter_mut().find(|(r, _)| *r == rid) {
@@ -5321,18 +5371,15 @@ pub(crate) async fn handle_get_sticker_packs(
             }
         }
         for (rid, keys) in by_room {
-            if let Some(source_room) = room_of(&client, &rid) {
+            if let Some(source_room) = room_of(client, &rid) {
                 packs.extend(
-                    room_sticker_packs(&source_room, "global", Some(&keys), &mut seen).await,
+                    room_sticker_packs(&source_room, "global", Some(&keys), seen).await,
                 );
             }
         }
     }
 
-    daemon.send(OutEvent::response(
-        req,
-        Event::StickerPacks { room_id, packs },
-    ));
+    packs
 }
 
 /// The `m.relates_to` of a sent sticker: in a thread, the `m.thread`
