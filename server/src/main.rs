@@ -69,12 +69,64 @@ struct Args {
     profile: String,
 
     /// Verbosity level (0-5)
-    #[arg(short, long, default_value = "3")]
+    #[arg(short, long, default_value = "2")]
     verbosity: u8,
 
     /// Log file path
     #[arg(short, long)]
     logfile: Option<std::path::PathBuf>,
+}
+
+/// A log file is renamed to this suffix once it grows past
+/// [`LOG_ROTATE_BYTES`], replacing the previous rotation.
+const LOG_ROTATE_SUFFIX: &str = "1";
+const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The subscriber's directives for a verbosity level.
+///
+/// `h2`/`hyper`'s frame logs are most of what a DEBUG daemon writes (40% of
+/// one 1.8 GB log) and tell nobody anything; `matrix_sdk` logs per event, so
+/// it sits at INFO until `-v 4` asks for the SDK's own trace.
+fn directives(verbosity: u8) -> String {
+    let level = match verbosity {
+        0 => "error",
+        1 => "warn",
+        2 => "info",
+        3 => "debug",
+        _ => "trace",
+    };
+    let sdk = if verbosity >= 4 { "" } else { ",matrix_sdk=info" };
+    format!("{level},h2=warn,hyper=warn,hyper_util=warn{sdk}")
+}
+
+/// Open the log for appending, first rotating it aside when it is over
+/// LIMIT bytes (`LOG_ROTATE_BYTES`), so a long-lived daemon cannot fill the
+/// disk.
+fn open_log(logfile: &std::path::Path, limit: u64) -> Result<std::fs::File> {
+    if let Ok(meta) = std::fs::metadata(logfile) {
+        if meta.len() > limit {
+            let rotated = logfile.with_file_name(format!(
+                "{}.{LOG_ROTATE_SUFFIX}",
+                logfile
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "elneo-server.log".into())
+            ));
+            let _ = std::fs::remove_file(&rotated);
+            // A rotation that fails is not worth refusing to start over:
+            // say so on stderr and append to the old file.
+            if let Err(e) = std::fs::rename(logfile, &rotated) {
+                eprintln!(
+                    "elneo-server: cannot rotate the log to {}: {e}",
+                    rotated.display()
+                );
+            }
+        }
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logfile)?)
 }
 
 #[tokio::main]
@@ -83,27 +135,18 @@ async fn main() -> Result<()> {
 
     // Setup logging.  The framed protocol uses stdout, so logs go to stderr
     // unless a log file is given (Emacs merges stderr into the process
-    // buffer, so it should normally pass -l explicitly).
-    let level = match args.verbosity {
-        0 => tracing::Level::ERROR,
-        1 => tracing::Level::WARN,
-        2 => tracing::Level::INFO,
-        3 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
-    };
+    // buffer, so it should normally pass -l explicitly).  The file rotates
+    // at 50 MB: an appended-forever log reached 1.8 GB in a month.
+    let filter = tracing_subscriber::EnvFilter::new(directives(args.verbosity));
     if let Some(logfile) = &args.logfile {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(logfile)?;
-        let writer = std::sync::Mutex::new(file);
+        let writer = std::sync::Mutex::new(open_log(logfile, LOG_ROTATE_BYTES)?);
         tracing_subscriber::fmt()
-            .with_max_level(level)
+            .with_env_filter(filter)
             .with_writer(writer)
             .init();
     } else {
         tracing_subscriber::fmt()
-            .with_max_level(level)
+            .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .init();
     }
@@ -128,4 +171,45 @@ async fn main() -> Result<()> {
 
     let daemon = daemon::ElneoDaemon::new(args.profile, ev_tx)?;
     daemon.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{directives, open_log};
+
+    #[test]
+    fn h2_and_hyper_stay_quiet_whatever_the_verbosity() {
+        for verbosity in 0..=5 {
+            let filter = directives(verbosity);
+            assert!(filter.contains("h2=warn"), "{filter}");
+            assert!(filter.contains("hyper=warn"), "{filter}");
+            assert!(filter.contains("hyper_util=warn"), "{filter}");
+        }
+        // The SDK's own trace is only silenced below -v 4.
+        assert!(directives(3).contains("matrix_sdk=info"));
+        assert!(!directives(4).contains("matrix_sdk=info"));
+        // The asked-for level is still the default one.
+        assert!(directives(2).starts_with("info,"));
+        assert!(directives(3).starts_with("debug,"));
+    }
+
+    #[test]
+    fn a_big_log_is_rotated_once_and_appended_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("elneo-server-test.log");
+        std::fs::write(&log, vec![b'x'; 40]).unwrap();
+
+        let mut file = open_log(&log, 10).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        let rotated = dir.path().join("elneo-server-test.log.1");
+        assert_eq!(std::fs::metadata(&rotated).unwrap().len(), 40);
+
+        use std::io::Write;
+        writeln!(file, "new").unwrap();
+        // A second open under the limit appends to the fresh file.
+        drop(file);
+        open_log(&log, 10).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 4);
+        assert_eq!(std::fs::metadata(&rotated).unwrap().len(), 40);
+    }
 }

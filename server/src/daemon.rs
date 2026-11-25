@@ -3,7 +3,10 @@
 //!
 //! Runtime shape: a single writer thread owns stdout (sync handlers would
 //! otherwise interleave framed events from concurrent tasks); stdin is read on
-//! a blocking thread feeding a command channel; commands run sequentially.
+//! a blocking thread feeding a command channel; commands run detached, each
+//! one's ack routed by request id, so a handler stuck on the homeserver never
+//! holds the ones behind it.  What must stay ordered (a room's sends) is
+//! serialised per room, not globally.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -56,6 +59,14 @@ pub struct Inner {
     /// In-flight media downloads, keyed by cache key (the media file's path
     /// without extension).  See `media.rs`.
     pub downloads: StdMutex<HashMap<String, media::Download>>,
+    /// Per-room send locks: two messages typed in a burst reach the
+    /// homeserver in the order they were typed, whatever order their
+    /// detached handler tasks get to run in.
+    pub send_queues: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The profile's single-instance lock, held for the process's life.
+    /// Two daemons on one data dir would share the sqlite and crypto
+    /// stores, which corrupts olm/megolm sessions beyond repair.
+    pub _instance_lock: std::fs::File,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +96,15 @@ impl Inner {
 
     pub fn ack(&self, req: Option<u64>, ok: bool, error: Option<String>) {
         self.send(OutEvent::ack(req, ok, error));
+    }
+
+    /// The send lock of one room, created on first use.
+    pub fn send_queue(&self, room_id: &str) -> Arc<Mutex<()>> {
+        let mut queues = self
+            .send_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queues.entry(room_id.to_string()).or_default().clone()
     }
 
     /// Clone of the current client, if any.
@@ -455,6 +475,7 @@ impl ElneoDaemon {
         let data_dir = get_profile_data_dir(&profile)?;
         check_profile_version(&data_dir, &profile)?;
         std::fs::create_dir_all(&data_dir)?;
+        let instance_lock = take_instance_lock(&data_dir, &profile)?;
         std::fs::write(data_dir.join("VERSION"), STORE_LAYOUT_VERSION.to_string())?;
 
         Ok(Self {
@@ -471,6 +492,8 @@ impl ElneoDaemon {
                 key_watchers: StdMutex::new(HashSet::new()),
                 received_keys_task: StdMutex::new(None),
                 downloads: StdMutex::new(HashMap::new()),
+                send_queues: StdMutex::new(HashMap::new()),
+                _instance_lock: instance_lock,
             }),
         })
     }
@@ -1253,7 +1276,21 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
                     let daemon = ElneoDaemon {
                         inner: self.inner.clone(),
                     };
-                    tokio::spawn(async move { daemon.handle_command(req, cmd).await });
+                    // The handler runs detached; this watcher awaits it
+                    // only to notice a panic.  A panicked handler otherwise
+                    // leaves its ack unsent, and the Emacs callback behind
+                    // it waits for a response that never comes.
+                    let inner = self.inner.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tokio::spawn(async move {
+                            daemon.handle_command(req, cmd).await
+                        })
+                        .await
+                        {
+                            error!("Command handler failed: {e}");
+                            inner.ack(req, false, Some("internal error".into()));
+                        }
+                    });
                 }
                 Err(e) => {
                     error!("Failed to parse command: {e}");
@@ -1272,6 +1309,30 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
         debug!("Input closed, daemon exiting");
         Ok(())
     }
+}
+
+/// Take the profile's single-instance lock (`daemon.lock`), or bail naming
+/// the file.  An advisory `flock`: released by the kernel when the process
+/// dies, so a crash never leaves a stale lock behind.
+fn take_instance_lock(data_dir: &std::path::Path, profile: &str) -> Result<std::fs::File> {
+    let path = data_dir.join("daemon.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening the instance lock {}", path.display()))?;
+    if file.try_lock().is_err() {
+        anyhow::bail!(
+            "another elneo-server already runs for profile '{profile}' ({} is locked); \
+             stop it first, or log out of it",
+            path.display()
+        );
+    }
+    // Ours now: record who holds it, for whoever reads the file next.
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(file)
 }
 
 fn get_profile_data_dir(profile: &str) -> Result<std::path::PathBuf> {
@@ -1600,8 +1661,23 @@ pub fn spawn_writer(events: mpsc::UnboundedReceiver<OutEvent>) {
 mod tests {
     use super::{
         check_profile_version, is_plain_http_url, migrate_data_base_from, set_aside_orphaned_store,
-        STORE_LAYOUT_VERSION,
+        take_instance_lock, STORE_LAYOUT_VERSION,
     };
+
+    /// One daemon per profile: the second start on a data dir fails, and
+    /// the lock frees when the holder goes (a crash releases it too, the
+    /// lock being an advisory `flock').
+    #[test]
+    fn the_instance_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = take_instance_lock(dir.path(), "test").expect("first start gets the lock");
+        assert!(take_instance_lock(dir.path(), "test").is_err());
+        drop(first);
+        assert!(take_instance_lock(dir.path(), "test").is_ok());
+        // The lock file names the holder, and lives in the data dir.
+        let text = std::fs::read_to_string(dir.path().join("daemon.lock")).unwrap();
+        assert_eq!(text.trim(), std::process::id().to_string());
+    }
 
     #[test]
     fn orphaned_store_moves_aside_only_without_a_session() {

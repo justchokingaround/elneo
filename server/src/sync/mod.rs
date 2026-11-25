@@ -6151,7 +6151,14 @@ pub async fn handle_send_message(
         };
         content.relates_to = Some(Relation::Reply(Reply::with_event_id(reply_id)));
     }
-    match room.send(content).await {
+    // Commands run detached, so two sends in a burst can reach this point
+    // in either order; the room's lock is taken in an order that follows
+    // the commands', keeping the conversation in the order it was typed.
+    let queue = daemon.send_queue(room.room_id().as_str());
+    let guard = queue.lock().await;
+    let sent = room.send(content).await;
+    drop(guard);
+    match sent {
         Ok(response) => {
             daemon.send(OutEvent::response(
                 req,
