@@ -1282,10 +1282,8 @@ verify this device against an existing one (M-x elneo-verify-device) instead"
                     // it waits for a response that never comes.
                     let inner = self.inner.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = tokio::spawn(async move {
-                            daemon.handle_command(req, cmd).await
-                        })
-                        .await
+                        if let Err(e) =
+                            tokio::spawn(async move { daemon.handle_command(req, cmd).await }).await
                         {
                             error!("Command handler failed: {e}");
                             inner.ack(req, false, Some("internal error".into()));

@@ -979,10 +979,9 @@ once the new daemon comes back online."
         (user-error "No running elneo-server daemon")
       (dolist (p targets)
         (message "Matrix [%s] restarting daemon" p)
+        ;; `elneo-server-stop' waits for the process to exit, so the
+        ;; sqlite store is free before the new daemon takes the lock.
         (elneo-server-stop p)
-        ;; Give the old process a moment to release the sqlite store
-        ;; before the new one opens it.
-        (sleep-for 0.2)
         (elneo-client--activate p)))))
 
 ;;;###autoload

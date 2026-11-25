@@ -256,7 +256,7 @@
     (setq elneo-daemon-protocol-minimum 99)
     (elneo-reload)
     (mx-check "reload refreshes elneo-daemon-protocol"
-              elneo-daemon-protocol 27)
+              elneo-daemon-protocol 28)
     (mx-check "reload refreshes elneo-daemon-protocol-minimum"
               elneo-daemon-protocol-minimum 1)
     (mx-check "reload leaves elneo-daemon-protocol-allow-outdated alone"

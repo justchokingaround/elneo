@@ -32,11 +32,22 @@ byte-compile: autoloads
 
 # Each test file is a self-contained batch script that kills Emacs with
 # a non-zero status on failure; they (require) the modules they test.
+# Every file runs: one red file must not hide the ones after it, so
+# failures are counted and the summary comes last.
 elisp-test: autoloads
-	@for t in $(wildcard test/*.el); do \
+	@failed=""; total=0; \
+	for t in $(wildcard test/*.el); do \
+		total=$$((total + 1)); \
 		echo "=== $$t ==="; \
-		$(EMACS) -Q --batch -L lisp -l $$t || exit 1; \
-	done
+		$(EMACS) -Q --batch -L lisp -l $$t || failed="$$failed $$(basename $$t)"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo ""; \
+		echo "elisp-test: $$total files ran, failed:$$failed"; \
+		exit 1; \
+	fi; \
+	echo ""; \
+	echo "elisp-test: $$total files, all green"
 
 clippy:
 	@cargo clippy --all-targets --manifest-path server/Cargo.toml -- -D warnings

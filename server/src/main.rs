@@ -95,7 +95,11 @@ fn directives(verbosity: u8) -> String {
         3 => "debug",
         _ => "trace",
     };
-    let sdk = if verbosity >= 4 { "" } else { ",matrix_sdk=info" };
+    let sdk = if verbosity >= 4 {
+        ""
+    } else {
+        ",matrix_sdk=info"
+    };
     format!("{level},h2=warn,hyper=warn,hyper_util=warn{sdk}")
 }
 

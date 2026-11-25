@@ -88,7 +88,7 @@
 
   ;; --- the protocol lockstep
 
-  (mx-check "lockstep: the protocol constant is 27" elneo-daemon-protocol 27)
+  (mx-check "lockstep: the protocol constant is 28" elneo-daemon-protocol 28)
 
   (message "%d ok, %d failed" pass fail)
   (when (> fail 0) (kill-emacs 1)))

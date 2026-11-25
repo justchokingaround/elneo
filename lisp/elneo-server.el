@@ -36,9 +36,12 @@
   :type 'string
   :group 'elneo)
 
-(defcustom elneo-server-verbosity 3
+(defcustom elneo-server-verbosity 2
   "Verbosity level for elneo-server (0-5).
-0 = error, 1 = warn, 2 = info, 3 = debug, 4+ = trace"
+0 = error, 1 = warn, 2 = info, 3 = debug, 4+ = trace (the SDK's own
+too).  The daemon caps h2/hyper frames at warn whatever this says, and
+rotates its log file at 50 MB.  Debug used to be the default and filled
+1.8 GB in a month."
   :type 'integer
   :group 'elneo)
 
@@ -156,6 +159,20 @@ Each callback table is a hash table mapping event types to callback functions.")
 Each pending table maps a request id (integer) to a callback function
 called with (PROFILE RESPONSE-EVENT) when the matching response arrives.")
 
+(defcustom elneo-server-request-timeout 120
+  "Seconds a request may go unanswered before its callback fails.
+A handler that panicked, or a socket gone quiet, otherwise leaves the
+view behind the request waiting for an answer that never comes.  Nil
+waits forever."
+  :type '(choice (const :tag "Forever" nil) natnum)
+  :group 'elneo)
+
+(defvar elneo-server--timers nil
+  "Alist of (PROFILE . TIMER-TABLE) for in-flight requests.
+Each timer table maps a request id to the timer that fails its callback
+once `elneo-server-request-timeout' has passed, mirroring
+`elneo-server--pending'.")
+
 (defvar elneo-server--next-req 1
   "Next request id for `elneo-server--call'.")
 
@@ -269,6 +286,35 @@ to recover (client handlers register only past the gate)."
       (push entry elneo-server--pending))
     (cdr entry)))
 
+(defun elneo-server--timer-table (profile)
+  "Get (creating if needed) the request-timer table for PROFILE."
+  (let ((entry (assoc profile elneo-server--timers)))
+    (unless entry
+      (setq entry (cons profile (make-hash-table :test #'eq)))
+      (push entry elneo-server--timers))
+    (cdr entry)))
+
+(defun elneo-server--cancel-request-timer (profile req)
+  "Cancel the deadline of REQ for PROFILE, if it is still armed."
+  (let ((timer (gethash req (elneo-server--timer-table profile))))
+    (when (timerp timer) (cancel-timer timer))
+    (remhash req (elneo-server--timer-table profile))))
+
+(defun elneo-server--request-timed-out (profile req)
+  "Fail REQ of PROFILE: its answer never came."
+  (remhash req (elneo-server--timer-table profile))
+  (let ((callback (gethash req (elneo-server--pending-table profile))))
+    (when callback
+      (remhash req (elneo-server--pending-table profile))
+      (condition-case err
+          (funcall callback profile
+                   (list (cons '@error
+                               (format "no answer from the daemon after %s s"
+                                       elneo-server-request-timeout))))
+        (error
+         (message "Matrix [%s] timed-out callback for request %s: %s"
+                  profile req err))))))
+
 ;;; Event handling
 
 (defun elneo-server--dispatch-event (profile event)
@@ -280,6 +326,7 @@ that request; all others dispatch to the typed callback table."
         (let ((callback (gethash req (elneo-server--pending-table profile))))
           (when callback
             (remhash req (elneo-server--pending-table profile))
+            (elneo-server--cancel-request-timer profile req)
             (condition-case err
                 (funcall callback profile event)
               (error
@@ -372,8 +419,16 @@ show its failure notice, not just sit empty)."
                                  profile req err)))))
                  table)
         (clrhash table))))
+  (let ((timers (cdr (assoc profile elneo-server--timers))))
+    (when timers
+      (maphash (lambda (_req timer)
+                 (when (timerp timer) (cancel-timer timer)))
+               timers)
+      (clrhash timers)))
   (setq elneo-server--pending
-        (assoc-delete-all profile elneo-server--pending)))
+        (assoc-delete-all profile elneo-server--pending))
+  (setq elneo-server--timers
+        (assoc-delete-all profile elneo-server--timers)))
 
 (defun elneo-server--sentinel (profile proc event)
   "Process sentinel for elneo-server PROC with PROFILE.
@@ -411,7 +466,10 @@ COMMAND should be an alist that will be JSON-encoded."
          (json-bytes (encode-coding-string json-str 'utf-8))
          (size (length json-bytes))
          (proc (elneo-server--get-process profile)))
-    (elneo--debug-log "Matrix [%s] sending: %s" profile (json-encode-alist command))
+    ;; Encoded for the log only when the log wants it: `elneo--debug-log'
+    ;; is a function, so its arguments are built whether or not it writes.
+    (when elneo-debug
+      (elneo--debug-log "Matrix [%s] sending: %s" profile (json-encode-alist command)))
     (process-send-string proc (format "send %d\n" size))
     (process-send-string proc json-bytes)
     (process-send-string proc "\n")))
@@ -427,7 +485,12 @@ commands on this despite the `--' name."
         (command (append command `((@req . ,elneo-server--next-req)))))
     (setq elneo-server--next-req (1+ elneo-server--next-req))
     (when callback
-      (puthash req callback (elneo-server--pending-table profile)))
+      (puthash req callback (elneo-server--pending-table profile))
+      (when elneo-server-request-timeout
+        (puthash req
+                 (run-at-time elneo-server-request-timeout nil
+                              #'elneo-server--request-timed-out profile req)
+                 (elneo-server--timer-table profile))))
     (elneo-server--send profile command)
     req))
 
@@ -700,6 +763,13 @@ corrupt the framed event stream."
       (message "Matrix [%s] server started" profile)
       proc)))
 
+(defcustom elneo-server-stop-timeout 3
+  "Seconds a stopping daemon gets to exit before it is killed.
+Closing its stdin ends the daemon's run loop, so it closes the sqlite
+and crypto stores in order; past this it is killed instead."
+  :type 'number
+  :group 'elneo)
+
 (defun elneo-server-stop (profile)
   "Stop elneo-server daemon for PROFILE."
   ;; completing-read with REQUIRE-MATCH and an empty collection leaves
@@ -721,8 +791,19 @@ corrupt the framed event stream."
       ;; whose auto-restart consumer looks at this flag and must see
       ;; the stop as deliberate.
       (push (cons profile t) elneo-server--manual-stops)
-      (delete-process proc)
-      (when buffer
+      ;; Ask before killing: EOF ends the daemon's run loop, so it exits
+      ;; with the stores closed.  A kill leaves sqlite to its journal,
+      ;; and the next daemon may open the profile before the old one's
+      ;; file descriptors are gone.  The new daemon's instance lock
+      ;; refuses to start in that window, so the wait matters.
+      (ignore-errors (process-send-eof proc))
+      (let ((deadline (+ (float-time) elneo-server-stop-timeout)))
+        (while (and (process-live-p proc) (< (float-time) deadline))
+          (accept-process-output proc 0.02)))
+      (when (process-live-p proc)
+        (elneo--debug-log "Matrix [%s] daemon did not exit, killing it" profile)
+        (delete-process proc))
+      (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (message "Matrix [%s] server stopped" profile))))
 

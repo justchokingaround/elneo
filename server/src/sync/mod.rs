@@ -5372,9 +5372,7 @@ async fn account_sticker_packs(client: &Client, seen: &mut HashSet<String>) -> V
         }
         for (rid, keys) in by_room {
             if let Some(source_room) = room_of(client, &rid) {
-                packs.extend(
-                    room_sticker_packs(&source_room, "global", Some(&keys), seen).await,
-                );
+                packs.extend(room_sticker_packs(&source_room, "global", Some(&keys), seen).await);
             }
         }
     }

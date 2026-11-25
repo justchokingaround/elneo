@@ -437,7 +437,11 @@ For *backups or uninstall*:
 - =drafts.el= at the data directory root: unsent room drafts (0600, local only)
 - in =~/.emacs.d/=: =elneo-accounts.el= (registered profiles, no secrets) and =elneo-server-<profile>.log= (daemon logs)
 
-*Security note*: the data directory holds the access token (=session.json=) and the encryption keys (sqlite stores), see [[https://github.com/aard-fi/elneo/issues/1][#1]]. Keep its permissions tight. The Emacs side stores only non-secrets (profile name, homeserver URL, user id, device id).  The password is used once for login and never stored — the daemon keeps the access token it issued instead.
+The daemon log rotates itself: past 50 MB it is renamed to =elneo-server-<profile>.log.1= (replacing the previous rotation) and a fresh one starts. =elneo-server-verbosity= (default =2=, info) sets what is written; =h2=/=hyper= frames stay at warnings whatever it says, and the SDK's own trace only from =4=. Nothing prints the access token or any message content.
+
+*One daemon per profile*: the daemon takes an advisory lock (=daemon.lock= in the profile's data directory) as it starts, so a second daemon on the same profile (another Emacs with elneo loaded, a restart overlapping the old process) refuses to start instead of opening the sqlite and crypto stores twice, which corrupts the encryption sessions beyond repair. A crashed daemon releases the lock with its process, so there is never a stale lock to clean up by hand. =M-x elneo-restart-server= closes the old daemon's stdin and waits for it to exit (up to =elneo-server-stop-timeout=, 3s) before starting the new one.
+
+A request that gets no answer at all (a handler that panicked, a socket gone quiet) has a deadline too: =elneo-server-request-timeout= (default 120s) fails its callback with a plain message instead of leaving the view behind it waiting forever. The daemon itself acks a panicked handler at once.
 
 Both the lisp and server side have a supported protocol number marker for their communication - a daemon whose protocol is too old for this client is not activated: the session refuses with a message. =elneo-daemon-protocol-allow-outdated= can be used to override it until providing a correct daemon. Overall we degrade gracefully on missing features, but there can be weird exceptions.
 

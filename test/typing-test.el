@@ -17,8 +17,10 @@
     (setq elneo-room--typing '("@alice:hs"))
     (elneo-room--typing-redisplay)
     (mx-check "buffer text untouched" (buffer-string) before)
+    ;; The separator fits its hints to the window, so which hint comes last
+    ;; depends on the width; what it may not lose is its own text.
     (mx-check "separator keeps its own text"
-              (and (string-match-p "dired ──\n" (buffer-string)) t) t)
+              (and (string-match-p "── draft[^\n]*──\n" (buffer-string)) t) t)
     (let ((ov elneo-room--typing-overlay))
       (mx-check "typing line sits at the separator's start"
                 (save-excursion (goto-char (overlay-start ov))
