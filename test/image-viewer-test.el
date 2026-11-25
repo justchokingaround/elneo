@@ -10,6 +10,9 @@
 ;; Run: emacs -Q --batch -L lisp -l test/image-viewer-test.el
 
 (require 'elneo-image)
+;; The viewer derives from `image-mode', which refuses to start where
+;; images cannot show (batch); no picture is drawn here anyway.
+(advice-add 'display-images-p :override #'always)
 
 (defconst mx-test-old-page
   `((@ok . t)
@@ -546,6 +549,148 @@
       (when (buffer-live-p viewer2) (kill-buffer viewer2))
       (when (buffer-live-p room2) (kill-buffer room2))
       (delete-other-windows)))
+
+;; ---- newest picture (`V' in the room) and the image-mode keys
+  (let* ((room-key (cons "newtest" "!r:newtest.org"))
+         (buf (get-buffer-create " *mx-img-new-room*")))
+    (with-current-buffer buf
+      (elneo-room-mode)
+      (setq elneo-room--profile "newtest"
+            elneo-room--room-id "!r:newtest.org"
+            elneo-room--seen (make-hash-table :test 'equal)
+            elneo-room--end-token nil)
+      (puthash room-key buf elneo-room--buffers)
+      (puthash room-key (list :display-name "New Room" :profile "newtest"
+                              :room-id "!r:newtest.org")
+               elneo--rooms)
+      (mx-check "newest: no picture loaded is a user-error"
+                (condition-case _ (progn (elneo-image-view-newest) 'opened)
+                  (user-error 'user-error))
+                'user-error)
+      (elneo-room--append-messages
+       (list (list :event-id "$n1" :ts 1000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.image" :body "n1.jpg" :media (mx-media "mxc://hs/n1"))
+             (list :event-id "$n2" :ts 2000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.image" :body "n2.jpg" :media (mx-media "mxc://hs/n2"))
+             (list :event-id "$nt" :ts 3000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.text" :body "a text after")))
+      (elneo-room--reset-input-area "")
+      ;; History keys only count once the first page rendered.
+      (setq elneo-room--backfilled t)
+      (mx-check "newest: V is the room's key" (key-binding "V") #'elneo-room--V)
+      (cl-letf (((symbol-function 'elneo-download-media) #'ignore))
+        ;; From the draft V types; from history it opens the newest.
+        (goto-char (elneo-room--input-beg-pos))
+        (elneo-room--V)
+        (mx-check "newest: V in the draft inserts"
+                  (char-before) ?V)
+        (delete-char -1)
+        (goto-char (point-min))
+        (search-forward "n1.jpg")
+        (elneo-room--V))
+      (with-current-buffer "*Matrix image: New Room*"
+        (mx-check "newest: V opens the newest picture" elneo-image--current-id "$n2")
+        (mx-check "viewer: an image-mode buffer" (derived-mode-p 'image-mode) 'image-mode)
+        (mx-check "viewer: n walks the room" (key-binding "n") #'elneo-image-next)
+        (mx-check "viewer: image-mode's i prefix" (keymapp (key-binding "i")) t)
+        (kill-buffer)))
+    (remhash room-key elneo--rooms)
+    (remhash room-key elneo-room--buffers)
+    (kill-buffer buf))
+
+  ;;; Jump: `j' returns from the picture to its message in the room
+
+  (let* ((room-key (cons "jtest" "!r:jtest.org"))
+         (buf (get-buffer-create " *mx-img-jump-room*"))
+         (calls nil))
+    (with-current-buffer buf
+      (elneo-room-mode)
+      (setq elneo-room--profile "jtest"
+            elneo-room--room-id "!r:jtest.org"
+            elneo-room--seen (make-hash-table :test 'equal)
+            elneo-room--end-token nil)
+      (puthash room-key buf elneo-room--buffers)
+      (puthash room-key (list :display-name "Jump Room" :profile "jtest"
+                              :room-id "!r:jtest.org")
+               elneo--rooms)
+      (elneo-room--append-messages
+       (list (list :event-id "$j1" :ts 1000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.image" :body "j1.jpg"
+                   :media (mx-media "mxc://hs/j1"))
+             (list :event-id "$jt" :ts 2000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.text" :body "between the pictures")
+             (list :event-id "$j2" :ts 3000 :sender "@a:hs" :is-own nil
+                   :msgtype "m.image" :body "j2.jpg"
+                   :media (mx-media "mxc://hs/j2"))))
+      (elneo-room--reset-input-area "")
+      (setq elneo-room--backfilled t)
+      (cl-letf (((symbol-function 'elneo-download-media) #'ignore))
+        (goto-char (point-min))
+        (search-forward "j2.jpg")
+        (goto-char (match-beginning 0))
+        (elneo-image-view-at-point)))
+    (let ((viewer (get-buffer "*Matrix image: Jump Room*")))
+      (with-current-buffer viewer
+        (mx-check "jump: g is the viewer's key"
+                  (key-binding (kbd "g")) #'elneo-image-jump-to-message)
+        (mx-check "jump: an image-mode buffer still"
+                  (derived-mode-p 'image-mode) 'image-mode)
+        ;; 1. the room takes the viewer's window, on the picture's message
+        (elneo-image-jump-to-message))
+      (mx-check "jump: the room takes the viewer's window"
+                (eq (window-buffer (selected-window)) buf) t)
+      (mx-check "jump: the viewer buffer stays"
+                (buffer-live-p viewer) t)
+      (mx-check "jump: point on the picture's message"
+                (with-current-buffer buf (elneo-room--event-id-at-point)) "$j2")
+
+      ;; 2. a room already on screen elsewhere is selected, not doubled
+      (switch-to-buffer viewer)
+      (let ((other (split-window)))
+        (set-window-buffer other buf)
+        (with-current-buffer viewer
+          (elneo-image-jump-to-message))
+        (mx-check "jump: an on-screen room is selected"
+                  (eq (selected-window) other) t)
+        (mx-check "jump: the viewer's window keeps the viewer"
+                  (eq (window-buffer (get-buffer-window viewer t)) viewer) t)
+        (delete-window other)
+        (switch-to-buffer viewer))
+
+      ;; 3. a picture older than the rendered history goes to the
+      ;; reply-jump driver (which paginates), not a silent no-op
+      (with-current-buffer viewer
+        (setq elneo-image--current-id "$unrendered")
+        (cl-letf (((symbol-function 'elneo-room--jump-to-reply)
+                   (lambda (id) (setq calls (cons id calls)))))
+          (elneo-image-jump-to-message))
+        (mx-check "jump: an unrendered id uses the paginating driver"
+                  calls '("$unrendered")))
+
+      ;; 4. no picture on display: nothing to jump from
+      (with-current-buffer viewer
+        (setq elneo-image--current-id nil)
+        (mx-check "jump: no picture is a user-error"
+                  (condition-case _ (progn (elneo-image-jump-to-message) 'jumped)
+                    (user-error 'user-error))
+                  'user-error))
+
+      ;; 5. the room buffer killed while browsing: reopen it, the pending
+      ;; jump lands with the first history page
+      (with-current-buffer viewer
+        (setq elneo-image--current-id "$j1")
+        (kill-buffer buf)
+        (cl-letf (((symbol-function 'elneo-room-jump-to-event)
+                   (lambda (profile room-id event-id &optional stay-put)
+                     (setq calls (list profile room-id event-id stay-put)))))
+          (elneo-image-jump-to-message))
+        (mx-check "jump: a killed room is reopened with the jump"
+                  calls '("jtest" "!r:jtest.org" "$j1" stay-put))))
+    (when (get-buffer "*Matrix image: Jump Room*")
+      (kill-buffer "*Matrix image: Jump Room*"))
+    (remhash room-key elneo--rooms)
+    (remhash room-key elneo-room--buffers)
+    (when (buffer-live-p buf) (kill-buffer buf)))
 
   (message "results: %d passed, %d failed" pass fail)
   (kill-emacs (if (zerop fail) 0 1)))

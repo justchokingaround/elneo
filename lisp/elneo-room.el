@@ -441,6 +441,7 @@ parent that is not loaded yet."
         (define-key map (kbd "<prior>") #'elneo-room-older)
         (define-key map (kbd "o") #'elneo-room--o)
         (define-key map (kbd "v") #'elneo-room--v)
+        (define-key map (kbd "V") #'elneo-room--V)
         (define-key map (kbd "w") #'elneo-room--w)
         ;; telega copies message text with `c'; the permalink sits on `l'.
         (define-key map (kbd "c") #'elneo-room--c)
@@ -3318,6 +3319,15 @@ the target event id is on the server either way."
   ;; The viewer is not needed until a key is pressed.
   (require 'elneo-image)
   (elneo-image-view-at-point))
+
+(declare-function elneo-image-view-newest "elneo-image")
+
+(elneo-room--defkey elneo-room--V ?V
+  "View the room's newest picture in the image viewer.
+Point can be anywhere over history: no hunting for the message of
+the picture someone just sent; `p' walks older from there."
+  (require 'elneo-image)
+  (elneo-image-view-newest))
 
 (defun elneo-room-open-thread ()
   "Open the thread the message at point belongs to.

@@ -12,10 +12,18 @@
 ;; has no equivalent, so the total is what the walk has seen so far
 ;; and a "+" suffix marks it approximate until the walk reaches the
 ;; start of history.
+;;
+;; The viewer is an `image-mode' buffer: the picture's bytes are the
+;; buffer text, shown through `image-toggle-display-image', so every
+;; image-mode command works on it (zoom, rotate, flip, crop, save,
+;; fit-to-window on resize).  The mode derives from `image-mode' but
+;; keeps n / p / q / o for the walk; `+' / `-' / `0' are its zoom
+;; shorthands over the image-mode commands.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'image-mode)
 (require 'elneo-client)
 (require 'elneo-room)
 
@@ -94,9 +102,6 @@ means the cap stopped the walk (a walk failure also stops it).")
   "Window the viewer was opened in; `elneo-image-quit' returns the
 room there.")
 
-(defvar-local elneo-image--zoom 1.0
-  "Display scale factor; 1.0 fits the window.")
-
 (defvar-local elneo-image--file nil
   "Cache path of the downloaded full-size file on display.")
 
@@ -110,28 +115,49 @@ lands on its ts-nearest survivor.")
 
 ;;; Mode
 
-(defvar elneo-image-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
-    (define-key map "n" #'elneo-image-next)
-    (define-key map "p" #'elneo-image-prev)
-    (define-key map "o" #'elneo-image-open-externally)
-    (define-key map "+" #'elneo-image-zoom-in)
-    (define-key map "-" #'elneo-image-zoom-out)
-    (define-key map "0" #'elneo-image-fit)
-    (define-key map "q" #'elneo-image-quit)
-    map)
-  "Keymap of `elneo-image-mode'.  Scrolling keys (SPC, DEL, mouse
-wheel) come from `special-mode-map'.")
+(defvar elneo-image-mode-map nil
+  "Keymap of `elneo-image-mode'.  The rest of `image-mode-map'
+\(i +, i r, s w, ...) is its parent.")
+
+;; Assigned with `setq', not through the `defvar's value: that one keeps
+;; the OLD keymap object when the file is reloaded, so a key added since
+;; would stay missing in the live session.
+(setq elneo-image-mode-map
+      (let ((map (make-sparse-keymap)))
+        ;; Set here, not left to `define-derived-mode': it takes the
+        ;; local map current after the parent ran, and `image-mode' on
+        ;; the empty buffer the viewer opens with installs none.
+        (set-keymap-parent map image-mode-map)
+        (define-key map "n" #'elneo-image-next)
+        (define-key map "p" #'elneo-image-prev)
+        (define-key map "g" #'elneo-image-jump-to-message)
+        (define-key map "o" #'elneo-image-open-externally)
+        (define-key map "+" #'elneo-image-zoom-in)
+        (define-key map "-" #'elneo-image-zoom-out)
+        (define-key map "0" #'elneo-image-fit)
+        (define-key map "q" #'elneo-image-quit)
+        map))
 
 ;;;###autoload
-(define-derived-mode elneo-image-mode special-mode "Matrix image"
+(define-derived-mode elneo-image-mode image-mode "Matrix image"
   "Full-size image viewer over a room's photo history.
 \\{elneo-image-mode-map}
 `n' / `p' step through the room's image messages (newer / older),
 loading older photos through filtered history pagination when the
-rendered history runs out.  The modeline shows [position/total]
-with a `+' while older images may still exist."
+rendered history runs out.  `g' returns to the message of the
+picture on display.  The modeline shows [position/total]
+with a `+' while older images may still exist.
+
+The buffer is an `image-mode' one, so image-mode's commands (zoom,
+rotate, crop, save) work on the picture on display."
+  ;; `image-mode' on an empty buffer (the viewer before its first
+  ;; download) bails out before its window and resize setup; do it
+  ;; here, so pictures inserted later get them.
+  (image-mode-setup-winprops)
+  (when (and image-auto-resize-on-window-resize
+             (fboundp 'image--window-state-change))
+    (add-hook 'window-state-change-functions
+              #'image--window-state-change nil t))
   (setq buffer-read-only t))
 
 ;;; Entry from the room buffer
@@ -184,7 +210,12 @@ history); rich-body embedded images and non-image media stay with
          ;; No token at all: history is exhausted, the seed is complete.
          (token (buffer-local-value 'elneo-room--end-token room-buffer)))
     (with-current-buffer buffer
-      (elneo-image-mode)
+      ;; Empty first: `image-mode' turns a buffer whose text is not an
+      ;; image (a previous placeholder) into a text mode, and says
+      ;; "Empty buffer" on an empty one.
+      (let ((inhibit-read-only t)) (erase-buffer))
+      (let ((inhibit-message t) (message-log-max nil))
+        (elneo-image-mode))
       (setq elneo-image--room-buffer room-buffer
             elneo-image--profile profile
             elneo-image--room-id room-id
@@ -194,7 +225,6 @@ history); rich-body embedded images and non-image media stay with
             elneo-image--exhausted (null token)
             elneo-image--walk-left elneo-image-walk-cap
             elneo-image--loading nil
-            elneo-image--zoom 1.0
             elneo-image--file nil
             elneo-image--downloading nil
             elneo-image--generation (1+ elneo-image--generation)
@@ -206,6 +236,19 @@ history); rich-body embedded images and non-image media stay with
       (elneo-image--show)
       (unless elneo-image--exhausted
         (elneo-image--walk-older)))))
+
+;;;###autoload
+(defun elneo-image-view-newest ()
+  "Open the room's newest picture in the image viewer.
+For the picture someone just sent: no hunting for its message, and
+`p' walks older from there.  Newest among the rendered history."
+  (interactive)
+  (unless (derived-mode-p 'elneo-room-mode)
+    (user-error "Not in a Matrix room"))
+  (let ((newest (car (last (elneo-image--room-images (current-buffer))))))
+    (unless newest
+      (user-error "No picture in the loaded history"))
+    (elneo-image--open (current-buffer) (plist-get newest :event-id))))
 
 ;;; Image list plumbing
 
@@ -355,16 +398,6 @@ copy browsable for as long as the viewer stays open."
 
 ;;; Display
 
-(defun elneo-image--fit-size ()
-  "Pixel (width . height) the current image is scaled to fit into.
-The viewer's window text area at 1.0 zoom; with the viewer in no
-window, the selected window's (`--insert-file' runs from the
-download callback's process filter, with whatever the user looks
-at selected)."
-  (let ((win (get-buffer-window (current-buffer) t)))
-    (cons (max 16 (round (* (window-width win t) elneo-image--zoom)))
-          (max 16 (round (* (window-height win t) elneo-image--zoom))))))
-
 (defun elneo-image--file-name (msg)
   "Display file name of image message MSG (filename field or body)."
   (or (alist-get 'filename (plist-get msg :media))
@@ -376,6 +409,8 @@ at selected)."
   (let* ((msg (elneo-image--current-msg))
          (inhibit-read-only t))
     (erase-buffer)
+    ;; The previous picture left the buffer unibyte (image bytes).
+    (set-buffer-multibyte t)
     (setq elneo-image--file nil
           elneo-image--downloading nil)
     (when msg
@@ -404,47 +439,59 @@ at selected)."
                      (elneo-image--insert-file (alist-get 'path event))
                    (let ((inhibit-read-only t))
                      (erase-buffer)
+                     (set-buffer-multibyte t)
                      (insert (propertize "[image unavailable]"
                                          'face 'shadow))))))))
          name))))
     (elneo-image--update-modeline)))
 
 (defun elneo-image--insert-file (file)
-  "Insert the full-size image FILE, fitted to the window.
+  "Show the full-size image FILE through `image-mode', fitted to the window.
+The bytes become the buffer text and `image-toggle-display-image'
+draws them, so image-mode's commands work on the picture; the
+transform state (zoom, rotation) starts over for each picture.
 When this Emacs cannot show FILE — an unsupported format such as
 avif, and no installed tool can convert it (`elneo--image-for-display'
 returns nil) — the buffer shows a note naming the file instead of a
 picture, and `o' opens it in an external viewer, which handles the
 formats Emacs does not.  `o' always opens FILE as downloaded, even
 when the picture on display is a converted copy."
-  (let* ((fit (elneo-image--fit-size))
-         (inhibit-read-only t)
-         (display (elneo--image-for-display file))
-         (img (condition-case nil
-                  (when display
-                    (create-image display nil nil :ascent 100
-                                  :max-width (car fit)
-                                  :max-height (cdr fit)))
-                (error nil)))
-         (name (or (elneo-image--file-name
-                    (elneo-image--current-msg))
-                   "image")))
+  (let ((inhibit-read-only t)
+        (display (elneo--image-for-display file))
+        (name (or (elneo-image--file-name
+                   (elneo-image--current-msg))
+                  "image")))
     (setq elneo-image--file file)
     (erase-buffer)
-    (if img
-        (progn
-          (insert-image img name)
-          (insert "\n"))
+    (unless (and display (elneo-image--display-bytes display))
+      (erase-buffer)
+      (set-buffer-multibyte t)
       (insert (propertize
                (format "[this Emacs cannot display %s — o opens it externally]"
                        name)
                'face 'shadow)))
     (elneo-image--update-modeline)))
 
-(defun elneo-image--refresh ()
-  "Redisplay the downloaded file at the current zoom."
-  (when elneo-image--file
-    (elneo-image--insert-file elneo-image--file)))
+(defun elneo-image--display-bytes (file)
+  "Insert FILE's bytes into the empty viewer and display them.
+Non-nil when the picture shows; nil (the buffer holding the bytes)
+when `image-mode' cannot draw them."
+  (set-buffer-multibyte nil)
+  (insert-file-contents-literally file)
+  (setq image-transform-resize image-auto-resize
+        image-transform-rotation 0.0
+        image-transform-scale 1)
+  (condition-case nil
+      (progn
+        (image-toggle-display-image)
+        ;; `image-toggle-display-image' fits to the window of the
+        ;; *selected* frame; the viewer may be in another frame's
+        ;; window (the download callback runs wherever the user is).
+        (dolist (win (get-buffer-window-list nil nil t))
+          (image-fit-to-window win))
+        (goto-char (point-min))
+        t)
+    (error nil)))
 
 (defun elneo-image--mode-line ()
   "Modeline: [position/total(+)] sender date filename."
@@ -507,6 +554,45 @@ cap stopped it) and new photos appear as they arrive."
           ;; Cap 0 disables the walk; say so, don't pretend to fetch.
           (message "No older image (the photo walk is disabled)"))))))
 
+;;; Jump to the message
+
+(defun elneo-image--room-window (room)
+  "Window already showing ROOM, or nil."
+  (and (buffer-live-p room) (get-buffer-window room t)))
+
+(defun elneo-image-jump-to-message ()
+  "Jump to the message of the picture on display, in its room.
+The room takes the viewer's window (the viewer buffer stays, as
+with `q'); a room already on screen in another window is selected
+instead, never doubled.  A message older than the room's loaded
+history paginates back through the reply-jump driver
+\(`elneo-room-jump-page-limit' pages), and a room buffer killed
+while browsing is reopened."
+  (interactive)
+  (let ((event-id elneo-image--current-id)
+        (room elneo-image--room-buffer))
+    (unless event-id
+      (user-error "No picture to jump from"))
+    (cond
+     ;; The room is on screen somewhere: go there.
+     ((elneo-image--room-window room)
+      (let ((win (elneo-image--room-window room)))
+        (select-window win)
+        (select-frame-set-input-focus (window-frame win)))
+      (with-current-buffer room
+        (elneo-room--jump-to-reply event-id)))
+     ;; Not on screen: it takes the viewer's window.
+     ((buffer-live-p room)
+      (select-window (or (get-buffer-window (current-buffer) t)
+                         (selected-window)))
+      (switch-to-buffer room)
+      (elneo-room--jump-to-reply event-id))
+     ;; Killed while browsing: reopen it; the pending jump lands with
+     ;; the first history page.
+     (t
+      (elneo-room-jump-to-event elneo-image--profile elneo-image--room-id
+                                event-id 'stay-put)))))
+
 (defun elneo-image-open-externally ()
   "Open the displayed image with `elneo-open-file-function'."
   (interactive)
@@ -517,20 +603,19 @@ cap stopped it) and new photos appear as they arrive."
 (defun elneo-image-zoom-in ()
   "Scale the displayed image up by 1.5x (0 resets)."
   (interactive)
-  (setq elneo-image--zoom (* elneo-image--zoom 1.5))
-  (elneo-image--refresh))
+  (image-increase-size 5))
 
 (defun elneo-image-zoom-out ()
-  "Scale the displayed image down by 1.5x (0 resets)."
+  "Scale the displayed image down to 0.7x (0 resets)."
   (interactive)
-  (setq elneo-image--zoom (/ elneo-image--zoom 1.5))
-  (elneo-image--refresh))
+  (image-decrease-size 3))
 
 (defun elneo-image-fit ()
-  "Reset the display to fit the window."
+  "Reset zoom and rotation: the picture fits the window again."
   (interactive)
-  (setq elneo-image--zoom 1.0)
-  (elneo-image--refresh))
+  (if (image-get-display-property)
+      (image-transform-reset-to-initial)
+    (message "Matrix: no image on display")))
 
 (defun elneo-image-quit ()
   "Quit the viewer, returning to its room buffer.

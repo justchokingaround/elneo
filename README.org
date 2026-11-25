@@ -66,7 +66,7 @@ TL;DR: Pretty much everything apart from voice and video calling — voice notes
 - *Room management*: the =C-c ?= settings view puts actions next to the facts they act on — name and topic, invite/kick/ban, per-room notification modes (all messages, mentions and keywords, muted), leave and forget, and pointers into upgraded rooms.
 - *Mention completion*: typing =@= in a room draft offers the room's member roster in a minibuffer picker. =@room= also is available. A mention — picked, or a full user id typed into the draft (=elneo-room-typed-mentions=) — goes out as an =m.mentions= block plus a matrix.to pill, even on a draft with no other markup (=elneo-room-mention-pills=); relay bridges then turn it into their own native ping, Discord users in a bridged guild channel included.
 - *Media*: on-disk media caching (view with =elneo-media-cache-dired=), background fetching and back-fill. Pictures are displayed inline, short animated GIFs/WebPs loop in place (capped by =elneo-room-animate-max-size=, =-max-frames= and =-max-seconds=; paused while the room is not on screen, off with =elneo-room-animate-images=), video messages show the sender's thumbnail with a =▶= mark, and an image or video caption renders on its own line under the thumbnail; voice notes render as waveforms; =RET= downloads the file and hands it to =elneo-voice-player-command= (a command like mpv) or, when unset, to whatever =elneo-open-file-function= opens media with — =ready-player-mode= makes playback work, the default =find-file= just shows the bytes. Formats Emacs cannot decode are converted on the way in (built-in =image-convert= first, then sips/magick), and images can be rescaled on the way out (a =C-u= on send prompts for a size; =elneo-image-oversize-action= can ask about big ones first). Attaching works by selecting a direct file, selecting via dired, sending from dired, sending from any buffer with a file attached, or by drag and drop.
-- *Image viewer*: =v= on an inline picture opens it full-size in a dedicated buffer; =n=/=p= walk the room's images, the =image-mode= zoom keys work, and =o= hands the original to your configured viewer. Room and account avatars open in the same viewer.
+- *Image viewer*: =v= on an inline picture opens it full-size in a dedicated buffer (=V= anywhere over history opens the newest one); =n=/=p= walk the room's images, the buffer is an =image-mode= one so its commands (zoom, rotate, crop, save) work, and =o= hands the original to your configured viewer. Room and account avatars open in the same viewer.
 - *Stickers* (MSC2545): =C-c C-s= in a room opens a sticker picker below it — the room's own image packs, its parent spaces' packs, your personal pack and the packs you enabled globally (the =im.ponies.*= packs Cinny, FluffyChat and Nheko create; images whose usage includes "sticker").  =RET= sends one as an =m.sticker= event (a reply in reply mode, a thread reply in a thread view), =/= narrows by shortcode, body or pack name, =TAB= jumps between packs.  Received stickers render inline like pictures.
 - *Polls* (MSC3381): Experimental support for both creating and answering polls - this seems to be about the messiest bit supported here, and with server side unread number counting may do weird things on reported unread messages when people vote.
 - *Threads* (MSC3440): there is experimental threads support, with threads marked with =🧵= and a different background colour. Threads can be viewed in an extra buffer, and main buffer replies to thread message also should make it into the correct thread.
@@ -229,6 +229,7 @@ Bare keys are commands on the history and self-insert in the draft — the same 
 |-----+---------------+-----------------------------------------------------------|
 | =o=   | =elneo-room--o= | Open the media message in an external viewer              |
 | =v=   | =elneo-room--v= | Open the image at point full-size in the image viewer     |
+| =V=   | =elneo-room--V= | Open the room's newest picture in the image viewer        |
 | =w=   | =elneo-room--w= | Copy the URL at point to the kill ring (link faces count) |
 | =I=   | =elneo-room--I= | Retry media display in the current view                   |
 | =s=   | =elneo-room--s= | Save the media at point to a file                         |
@@ -285,13 +286,17 @@ Bare keys are commands on the history and self-insert in the draft — the same 
 |-----+-----------------------------+------------------------------------|
 | =n=   | =elneo-image-next=            | Next photo in the room             |
 | =p=   | =elneo-image-prev=            | Previous photo                     |
+| =g=   | =elneo-image-jump-to-message= | Back to the photo's message        |
 | =o=   | =elneo-image-open-externally= | Open with =elneo-open-file-function= |
 | =+=   | =elneo-image-zoom-in=         | Zoom in                            |
 | =-=   | =elneo-image-zoom-out=        | Zoom out                           |
 | =0=   | =elneo-image-fit=             | Fit to window                      |
 | =q=   | =elneo-image-quit=            | Back to the room                   |
 
+The viewer derives from =image-mode=: the rest of =image-mode-map= (=i +=, =i r=, =i h=, =i c=, =i o=, ...) works on the picture on display.
+
 The modeline shows =[position/total]= over the room's photo messages; older photos arrive through filtered history pagination.
+=g= returns to the message of the photo on display: the room takes the viewer's window (a room already on screen elsewhere is selected instead), paginating back through the reply-jump driver (=elneo-room-jump-page-limit= pages) when the message is older than the loaded history.
 
 The =Matrix Avatar= viewer (a room's or account's avatar picture, opened from the room overview or the account page) has the same shape in miniature: =o= opens the original externally, =q= quits, SPC/DEL scroll.
 
