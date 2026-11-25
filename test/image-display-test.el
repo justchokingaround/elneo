@@ -421,22 +421,43 @@ A video's play prefix is deliberately read-only, so plain
                   elneo-image--file "/cache/avif")))
 
     ;; A rescue converts for display but keeps the original current
-    ;; — `o' opens the file as received, not the conversion.
+    ;; — `o' opens the file as received, not the conversion.  The
+    ;; viewer is an image-mode buffer: the converted copy's bytes are
+    ;; the text, drawn by `image-toggle-display-image'.
     (with-current-buffer buffer
       (cl-letf (((symbol-function 'elneo--image-for-display)
                  (lambda (_path) "/t/conv.png"))
-                ((symbol-function 'create-image)
-                 (lambda (&rest _args) '(fake-image)))
-                ((symbol-function 'insert-image)
-                 (lambda (_img string &rest _props) (insert string)))
+                ((symbol-function 'insert-file-contents-literally)
+                 (lambda (file &rest _) (insert "bytes of " file)))
+                ((symbol-function 'image-toggle-display-image)
+                 (lambda () (put-text-property (point-min) (point-max)
+                                               'display '(fake-image))))
                 ((symbol-function 'elneo-image--current-msg) (lambda () nil))
                 ((symbol-function 'elneo-image--update-modeline)
                  (lambda () nil)))
         (elneo-image--insert-file "/cache/avif")
         (mx-check "viewer: a rescue displays the converted copy"
-                  (buffer-string) "image\n")
+                  (list (buffer-string)
+                        (get-text-property (point-min) 'display))
+                  '("bytes of /t/conv.png" (fake-image)))
         (mx-check "viewer: o still opens the original file"
-                  elneo-image--file "/cache/avif")))
+                  elneo-image--file "/cache/avif"))
+
+      ;; A picture image-mode cannot draw falls back to the note: the
+      ;; toggle signals and the buffer keeps the file for `o'.
+      (cl-letf (((symbol-function 'insert-file-contents-literally)
+                 (lambda (_file &rest _) (insert "not really an image")))
+                ((symbol-function 'image-toggle-display-image)
+                 (lambda () (error "bad image")))
+                ((symbol-function 'elneo-image--current-msg) (lambda () nil))
+                ((symbol-function 'elneo-image--update-modeline)
+                 (lambda () nil)))
+        (elneo-image--insert-file "/cache/bad.png")
+        (mx-check "viewer: an undrawable picture falls back to the note"
+                  (buffer-string)
+                  "[this Emacs cannot display image — o opens it externally]")
+        (mx-check "viewer: the undrawable file still opens with o"
+                  elneo-image--file "/cache/bad.png")))
     (kill-buffer buffer))
 
   ;; ---- elneo-room--on-media-file: RET/o open a picture as a file
